@@ -1,0 +1,58 @@
+.venv/
+.venv-probe/
+__pycache__/
+*.py[cod]
+.DS_Store
+*~
+~
+runs/
+# Private PoC outputs also stay ignored with custom --state/--output paths.
+pairing.json
+bond.json
+bond.json.tmp
+.pairing-*
+events.jsonl
+activation-response-*.bin
+activation-failure.bin
+resources/
+# Reference traces and payloads include credentials and personal traffic.
+*.pcap
+*.pcapng
+*.cap
+*.pklg
+*.btsnoop
+*.snoop
+*.pcap.gz
+*.pcapng.gz
+*.pklg.gz
+# Firmware and extracted binaries/caches are local analysis inputs.
+firmware/
+extracted/
+caches/
+libraries/
+*.ipsw
+*.dmg
+*.aea
+# Generated analysis includes device identifiers, keys and personal traffic.
+# Keep source, guides and public firmware-source metadata trackable.
+analysis/*
+!analysis/*.md
+!analysis/*.py
+!analysis/firmware-source.json
+# Local handoffs bundle private capture-derived information.
+HANDOFF.md
+mac-handoff.zip
+# Credentials, local configuration and logs.
+.env
+.env.*
+!.env.example
+.aws/
+*.key
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+*.log
+
+# Local firmware archives.
+*.zip

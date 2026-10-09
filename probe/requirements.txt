@@ -1,0 +1,14 @@
+# Bluetooth host stack.
+bumble==0.0.235
+
+# X448, ML-KEM and AES-GCM. The OpenSSL backend needs version 48+ for ML-KEM.
+cryptography>=48
+
+# Native P-256 point operations for Apple's SPAKE2+ profile.
+pycryptodome>=3.24,<4
+
+# Reads the companion phone profile (phone_profile.yaml).
+PyYAML>=6,<7
+
+# Activation HTTPS client. The relay uses HTTP/1.1.
+httpx[http2]>=0.28,<1
