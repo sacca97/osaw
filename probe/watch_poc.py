@@ -10,7 +10,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import secrets
 import struct
 import sys
@@ -25,8 +24,8 @@ def seconds_or_unlimited(value):
 
 
 def ids_timeout(setup_timeout):
-    """IdsSession adds and compares this value, so 'no limit' is a very large number, not None."""
-    return 1e9 if setup_timeout == math.inf else setup_timeout
+    """Preserve an indefinite application deadline."""
+    return setup_timeout
 
 
 def setup_payload(service_data):
@@ -131,20 +130,41 @@ async def run(args):
     from pairing_store import Store, user_owned
     from normal_link import NormalLink, accept_prelude, prelude
     from ids_session import IdsSession
+    from relay_proxy import RelayProxy
     from setup_flow import SetupFlow
     from watch_link import Ertm, RelayLink
 
     os.umask(0o077)
-    store = None if args.scan else Store(args.state)
-    if store and not args.resume and 'peer_notifies' in store.data:
-        raise ValueError('State already contains Watch keys. Use --resume; for an erased Watch select a new --state directory.')
-    if store and args.resume and not store.data.get('bonded'):
-        raise ValueError('--resume requires an existing authenticated Bluetooth bond in the selected state directory')
-    if args.resume and not args.peer:
-        args.peer = store.data.get('peer_address')
+    # Reuse durable identities; a reset Watch always gets a separate directory.
+    saved = []
+    for path in args.output.glob('pairing*/pairing.json'):
+        data = json.loads(path.read_text())
+        if data.get('bonded') and data.get('peer_address') and data.get('watch_product'):
+            saved.append(path)
+    saved.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    choice = 0
+    if saved:
+        print('0. Pair a reset Watch (preserves existing bonds)', flush=True)
+        for number, path in enumerate(saved, 1):
+            data = json.loads(path.read_text())
+            print(f"{number}. Reconnect {data['watch_product']} — {data['peer_address']} ({path.parent.name})", flush=True)
+        while True:
+            answer = await asyncio.to_thread(input, 'Watch [1]: ')
+            if not answer:
+                choice = 1
+                break
+            if answer.isdecimal() and 0 <= int(answer) <= len(saved):
+                choice = int(answer)
+                break
+            print(f'Enter a number from 0 to {len(saved)}.', flush=True)
+    args.resume = choice != 0
+    args.state = (saved[choice - 1].parent if args.resume else
+                  args.output / (datetime.now(timezone.utc).strftime('pairing-%Y%m%dT%H%M%SZ-') + secrets.token_hex(4)))
+    store = Store(args.state)
+    print(f'Private pairing state: {store.directory.resolve()}', flush=True)
+    if args.resume:
+        args.peer = store.data['peer_address']
         args.address_type = store.data.get('peer_address_type', 'random')
-        if not args.peer:
-            raise ValueError('Saved bond has no peer identity; this older state needs an explicit --peer')
     run_dir = args.output / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + secrets.token_hex(4))
     run_dir.mkdir(parents=True, mode=0o700)
     user_owned(args.output)
@@ -157,16 +177,80 @@ async def run(args):
             return files.enter_context(os.fdopen(fd, mode, buffering=0 if 'b' in mode else -1))
         events = private_file('events.jsonl', 'w')
         snoop = private_file('hci.btsnoop', 'wb')
+        library_log = logging.StreamHandler(private_file('library.log', 'w'))
+        library_log.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        logging.getLogger().addHandler(library_log)
+        files.callback(logging.getLogger().removeHandler, library_log)
+        status_labels = {
+            'start': 'Starting companion',
+            'controller_ready': 'Bluetooth controller ready',
+            'finding_bonded_watch': 'Connecting to saved Watch',
+            'watch_selected': 'Watch selected',
+            'channel_accepted': 'Watch transport connected',
+            'pin_authenticated': 'PIN authenticated',
+            'bluetooth_bond_confirmed': 'Bluetooth bond confirmed',
+            'normal_link_ready': 'Authenticated Watch link connected',
+            'ids_lanes_ready': 'Companion channels connected',
+            'ids_transport_busy': 'Companion traffic busy; continuing service handling',
+            'normal_tun_backpressure': 'Bluetooth forwarding busy; applying backpressure',
+            'proxy_announcement_acknowledged': 'Proxy announcement acknowledged',
+            'relay_proxy_connected': 'Internet relay connected',
+            'ids_device_info_verified': 'Watch device info verified',
+            'watch_activation_confirmed': 'Watch activation confirmed',
+            'setup_protocol_complete': 'Watch setup confirmed',
+            'reconnected_to_initialized_watch': 'Reconnected to initialized Watch',
+        }
+        displayed_status = set()
         def record(event, **fields):
             events.write(json.dumps({'event': event, 'epoch': time.time(), **fields}) + '\n')
             events.flush()
+            if not args.verbose:
+                label = status_labels.get(event)
+                if event == 'timesync_answered' and fields.get('message_type') == 8:
+                    label = 'Clock update queued'
+                if event == 'ble_connection_parameters':
+                    label = f"Bluetooth interval: {fields['interval_ms']:g} ms"
+                if event == 'ota_message_received':
+                    errors = fields.get('error_field_details', {}).get('archived_errors', [])
+                    label = 'Update scan response received'
+                    if errors:
+                        last = errors[-1]
+                        label = f"Update scan failed: {last.get('reason', last.get('result_name', last.get('domain', 'error')))} ({last['code']})"
+                if event == 'aborted' or event.endswith('_failed'):
+                    label = event.replace('_', ' ')
+                    if fields.get('error'):
+                        label += ': ' + fields['error']
+                # Repeated flows/errors stay in the files without flooding the console.
+                if label and label not in displayed_status:
+                    displayed_status.add(label)
+                    print(f'{datetime.now():%H:%M:%S} {label}', flush=True)
+                return
             stamp = datetime.now().strftime('%H:%M:%S')
             details = ' '.join(f'{key}={fields[key]}' for key in
-                               ('lane', 'port', 'type', 'length', 'command', 'sequence', 'stream', 'correlated', 'flags', 'operation', 'version', 'error', 'error_function', 'error_line', 'stage', 'ids_phase', 'ertm_pending', 'ids_lanes', 'peer_info', 'local_info_ack', 'info_replies_pending')
+                               ('lane', 'port', 'type', 'length', 'command', 'sequence', 'stream', 'correlated', 'flags', 'operation', 'version', 'error', 'error_function', 'error_line', 'stage', 'ids_phase', 'ertm_pending', 'ids_lanes', 'peer_info', 'local_info_ack', 'info_replies_pending',
+                                'mode', 'response', 'success_present', 'accepted', 'success',
+                                'phone_minimum', 'phone_maximum', 'watch_version', 'property_count', 'properties',
+                                'state_name', 'timestamp', 'applied', 'state', 'watch_setup_present', 'watch_is_setup',
+                                'activation', 'sync_complete', 'completion_ack', 'watch_sync_progress',
+                                'watch_global_progress', 'client_sync_progress', 'payload_format',
+                                'numeric_fields', 'bundle_id', 'error_domain', 'archived_errors',
+                                'field_summary', 'application_handler', 'response_expected',
+                                'error_details', 'error_field_details', 'collection_counts', 'notify', 'message_id',
+                                'endpoint', 'address', 'proxy_flags', 'ike_ack', 'host', 'service',
+                                'bytes_to_upstream', 'bytes_to_watch', 'errno', 'phase', 'proxy_probe',
+                                'destination', 'source_port', 'direction', 'prefix_format',
+                                'bytes_from_watch', 'bytes_from_upstream', 'protocol', 'count',
+                                'message_type', 'host_unix', 'host_monotonic', 'timezone',
+                                'remote_mach', 'remote_rtc', 'uncertainty', 'time_source',
+                                'tcp_pending', 'waited_seconds', 'queued_packets',
+                                'ertm_window', 'ertm_mps', 'ertm_tx_frames', 'ertm_acked', 'ertm_retransmissions',
+                                'interval_ms', 'requested_interval_ms', 'latency', 'supervision_timeout_ms')
                                if key in fields)
             print(f'{stamp} {event.replace("_", " ")} {details}'.rstrip(), flush=True)
-        record('start', transport=args.transport, peer=args.peer, resume=args.resume, hardware_validated=False)
+        record('start', transport=args.transport, peer=args.peer, resume=args.resume,
+               proxy_probe=args.proxy_probe, hardware_validated=False)
         connection = normal = ids = pairing_link = relay = proxy = transport = signal_task = None
+        relay_proxy = None
         heartbeat_task = None
         setup_flow = None
         handlers = {}
@@ -174,13 +258,17 @@ async def run(args):
             while True:
                 await asyncio.sleep(10)
                 record('progress', stage=store.data.get('stage', 'scan') if store else 'scan',
-                       ertm_pending=sum(handler.pending is not None for handler in handlers.values()),
+                       ertm_pending=sum(len(handler.unacknowledged) for handler in handlers.values()),
+                       ertm_tx_frames=sum(handler.tx_frames for handler in handlers.values()),
+                       ertm_acked=sum(handler.tx_acknowledged for handler in handlers.values()),
+                       ertm_retransmissions=sum(handler.tx_retransmissions for handler in handlers.values()),
                        ids_lanes=len(ids.lanes) if ids else 0,
                        ids_phase=ids.phase if ids else 'not_started',
                        ids_hello=bool(ids and ids.peer_hello),
                        **({'peer_info': setup_flow.peer_info,
                            'local_info_ack': setup_flow.local_info_ack,
-                           'info_replies_pending': len(setup_flow.local_info_sequences)}
+                           'info_replies_pending': len(setup_flow.local_info_sequences),
+                           **setup_flow.diagnostic_status()}
                           if setup_flow else {}))
         try:
             transport = await open_transport(args.transport)
@@ -245,7 +333,7 @@ async def run(args):
                 setup_payload(b'\x25\xfe\x06' + setup)
             product = args.product or (store.data.get('watch_product') if args.resume else setup_product(setup))
             if not product:
-                raise ValueError('Resume needs saved Watch product or --product')
+                raise ValueError('Saved bond has no Watch product')
             if not args.resume:
                 store.save(setup_data=setup.hex(), watch_product=product)
             incoming = asyncio.Queue(maxsize=256)
@@ -348,13 +436,17 @@ async def run(args):
                     status, service, tx_cid = struct.unpack('<BHH', accepted)
                     if status or service != sid or tx_cid < 64 or any(h.tx_cid == tx_cid for h in handlers.values()):
                         raise ValueError('Watch rejected the requested Magnet channel')
-                    ertm = Ertm(connection, tx_cid, record, args.timeout)
+                    normal_channel = name == 'com.apple.terminusLink'
+                    ertm = Ertm(connection, tx_cid, record, args.timeout,
+                                window=args.ertm_window if normal_channel else 1,
+                                mps=args.ertm_mps if normal_channel else 1000)
                     handlers[cid] = ertm
                     for packet in opening_channels[cid]:
                         ertm.feed(packet)
                 finally:
                     del opening_channels[cid]
-                record('channel_accepted', service=name, rx_cid=cid, tx_cid=tx_cid)
+                record('channel_accepted', service=name, rx_cid=cid, tx_cid=tx_cid,
+                       ertm_window=ertm.window, ertm_mps=ertm.mps)
                 return ertm
             if args.resume:
                 smp_allowed = True
@@ -416,10 +508,41 @@ async def run(args):
             relay = RelayLink(ertm, record, args.timeout)
             normal = NormalLink(relay, record, store, local, remote)
             await normal.start()
+            def record_connection_parameters():
+                parameters = connection.parameters
+                record('ble_connection_parameters', interval_ms=parameters.connection_interval,
+                       latency=parameters.peripheral_latency,
+                       supervision_timeout_ms=parameters.supervision_timeout)
+            record_connection_parameters()
+            connection.on(connection.EVENT_CONNECTION_PARAMETERS_UPDATE, record_connection_parameters)
+            if args.connection_interval_ms is not None:
+                record('ble_parameters_update_requested', requested_interval_ms=args.connection_interval_ms)
+                try:
+                    await asyncio.wait_for(connection.update_parameters(
+                        connection_interval_min=args.connection_interval_ms,
+                        connection_interval_max=args.connection_interval_ms,
+                        max_latency=0, supervision_timeout=2000), min(args.timeout, 5))
+                except Exception as error:
+                    record('ble_parameters_update_failed', error=type(error).__name__,
+                           requested_interval_ms=args.connection_interval_ms, reason=str(error))
+                # A rejected request leaves the actual controller parameters in place.
+                record_connection_parameters()
+            relay_proxy = RelayProxy(record, [normal.sessions[lane].local_address for lane in ('d', 'c')])
+            await relay_proxy.start()
             ids = IdsSession(normal, store, record, ids_timeout(args.setup_timeout),
                              listen_only=args.control_mode == 'listen' or (args.control_mode == 'auto' and args.resume),
                              allow_wake_recovery=args.control_mode == 'auto' and args.resume)
             await ids.start()
+            if not relay_proxy.bound_addresses:
+                raise OSError('Companion relay requires a bound listener')
+            # Prefer the D endpoint, while native senders prefer C for the IKE notify.
+            endpoint = relay_proxy.bound_addresses[0]
+            try:
+                await normal.announce_proxy(endpoint, relay_proxy.port)
+            except TimeoutError as error:
+                record('proxy_announcement_failed', error=type(error).__name__,
+                       endpoint=endpoint, port=relay_proxy.port, ike_ack=False)
+                # Keep the diagnostic session alive to observe late Watch flows.
             proxy = ActivationProxy(record, store.directory)
             setup_flow = SetupFlow(ids, store, record, proxy, product, args.language, args.locale, args.timezone)
             async with asyncio.timeout(None if args.setup_timeout == math.inf else args.setup_timeout):
@@ -450,6 +573,8 @@ async def run(args):
                 await asyncio.gather(signal_task, return_exceptions=True)
             if proxy:
                 proxy.close()
+            if relay_proxy:
+                await relay_proxy.close()
             for resource in (ids, normal, relay, pairing_link):
                 if resource:
                     try:
@@ -473,40 +598,25 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    action = parser.add_mutually_exclusive_group()
-    action.add_argument('--scan', action='store_true', help='Only list advertisements; default discovers and sets up the Watch')
-    action.add_argument('--peer', help='Optional explicit Watch MAC; default discovers and selects a setup-mode Watch')
-    parser.add_argument('--resume', action='store_true', help='Reuse the selected state and Bluetooth bond')
-    parser.add_argument('--state', type=Path, default=Path('runs/pairing'))
-    parser.add_argument('--output', type=Path, default=Path('runs'))
-    parser.add_argument('--transport', default='hci-socket:0')
-    parser.add_argument('--address-type', choices=('random', 'public'), default='random')
-    parser.add_argument('--setup-data', help='Diagnostic twelve-byte hex override with --peer; normally discovered automatically')
-    parser.add_argument('--product', help='Expected Watch product, otherwise decoded from setup advertisement')
-    parser.add_argument('--timeout', type=positive_seconds, default=30)
-    parser.add_argument('--setup-timeout', type=seconds_or_unlimited, default=900,
-                        help='seconds for each setup wait, 0 for no limit')
-    parser.add_argument('--control-mode', choices=('auto', 'initiate', 'listen'), default='auto',
-                        help='ids-control startup: initiate SYNs it, listen waits for the Watch; auto listens with --resume')
-    parser.add_argument('--hold', type=seconds_or_unlimited, default=300,
-                        help='seconds to stay connected after setup, 0 to stay until interrupted')
-    parser.add_argument('--language', default='en-US')
-    parser.add_argument('--locale', default='en_US')
-    parser.add_argument('--timezone', default='UTC')
+    parser.add_argument('--transport', default='hci-socket:0',
+                        help='Linux HCI transport (default: hci-socket:0)')
+    parser.add_argument('--connection-interval-ms', type=float, choices=(7.5, 15.0, 30.0),
+                        help='Request a shorter BLE interval; rejection preserves the current link')
+    parser.set_defaults(scan=False, peer=None, resume=False, proxy_probe=True,
+                        verbose=os.environ.get('OSAW_VERBOSE') == '1',
+                        ertm_window=32, ertm_mps=2042,
+                        output=Path(__file__).resolve().parent / 'runs',
+                        address_type='random', setup_data=None, product=None,
+                        timeout=30, setup_timeout=math.inf, control_mode='auto',
+                        activation_lock='stop', hold=math.inf,
+                        language='en-US', locale='en_US', timezone='Europe/Paris')
     args = parser.parse_args()
-    if args.peer and not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', args.peer):
-        parser.error('--peer must be a Bluetooth MAC')
-    if args.setup_data and not re.fullmatch(r'[0-9a-fA-F]{24}', args.setup_data):
-        parser.error('--setup-data must be exactly twelve bytes in hex')
-    if args.resume and args.scan:
-        parser.error('--resume cannot be combined with --scan')
-    if args.setup_data and not args.peer:
-        parser.error('--setup-data is a diagnostic override requiring --peer; automatic discovery collects it normally')
-    if args.product and not re.fullmatch(r'Watch\d+,\d+', args.product):
-        parser.error('--product must look like Watch7,14')
+    if not args.transport.startswith('hci-socket:') or not args.transport[11:].isdecimal():
+        parser.error('--transport must be hci-socket:<controller index>')
     if sys.platform != 'linux':
         parser.error('Live scan/setup requires Linux (raw HCI and /dev/net/tun); --help and offline checks work on macOS')
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING,
+                        handlers=[logging.StreamHandler()] if args.verbose else [logging.NullHandler()])
     try:
         asyncio.run(run(args))
         return 0

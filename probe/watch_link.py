@@ -1,26 +1,43 @@
 """Apple dynamic CID transport: bounded ERTM and ordered NRLP stream.
 
 Unsegmented SDUs are enough: NRLP and IKE can split their own messages.
-One outstanding frame keeps window/retransmission behavior deterministic.
+Pairing uses one outstanding frame; normal links can pipeline a bounded window.
 """
 import asyncio
 import struct
 import time
+from collections import OrderedDict, deque
 from nrlp import Stream, build_inner_message
 
 
 class Ertm:
-    def __init__(self, connection, tx_cid, record, timeout=30):
+    def __init__(self, connection, tx_cid, record, timeout=30, window=1, mps=1000):
+        if not 1 <= window <= 32 or not 1 <= mps <= 2042:
+            raise ValueError('Unsupported ERTM window or MPS')
         self.connection, self.tx_cid, self.record = connection, tx_cid, record
         self.timeout, self.tx_seq, self.rx_seq = timeout, 0, 0
-        # ponytail: one SDU per ACK; widen the window only if live throughput blocks setup.
-        self.pending = None
+        self.window, self.mps = window, mps
+        self.unacknowledged = deque()
+        self.history = OrderedDict()
+        self.timer = None
+        self.closed = False
+        self.last_progress = time.monotonic()
+        self.tx_frames = self.tx_acknowledged = self.tx_retransmissions = 0
         self.ready = asyncio.Event()
         self.ready.set()
         self.incoming = asyncio.Queue(maxsize=256)
         self.lock = asyncio.Lock()
         self.error = None
         self.remote_busy = False
+
+    @property
+    def pending(self):
+        return self.unacknowledged[0] if self.unacknowledged else None
+
+    def retransmit(self, frames):
+        for seq, data in frames:
+            self.raw_send((seq << 1) | (self.rx_seq << 8), data)
+            self.tx_retransmissions += 1
 
     def raw_send(self, control, payload=b''):
         self.connection.send_l2cap_pdu(self.tx_cid, struct.pack('<H', control) + payload)
@@ -29,28 +46,41 @@ class Ertm:
         self.raw_send(1 | (self.rx_seq << 8) | (0x80 if final else 0) | (0x10 if poll else 0))
 
     def feed(self, packet):
+        if self.closed:
+            return
         try:
             if len(packet) < 2:
                 raise ValueError('Short ERTM frame')
             control = struct.unpack_from('<H', packet)[0]
             ack = (control >> 8) & 63
-            if self.pending is not None:
-                seq, data = self.pending
-                if ack == (seq + 1) % 64:
-                    self.pending = None
-                    self.ready.set()
-                elif ack != seq:
-                    raise ValueError('ERTM acknowledgement exceeds transmit window')
-            elif ack != self.tx_seq:
-                raise ValueError('Unexpected ERTM acknowledgement')
+            base = self.pending[0] if self.pending else self.tx_seq
+            distance = (ack - base) % 64
+            if distance <= len(self.unacknowledged):
+                for _ in range(distance):
+                    seq, data = self.unacknowledged.popleft()
+                    self.history.pop(seq, None)
+                    self.history[seq] = data
+                    while len(self.history) > 32:
+                        self.history.popitem(last=False)
+                if distance:
+                    self.tx_acknowledged += distance
+                    self.last_progress = time.monotonic()
+            elif self.window == 1 or not 0 < (base - ack) % 64 <= 32:
+                raise ValueError('ERTM acknowledgement exceeds transmit window')
+            # A delayed supervisory ACK behind the current window is stale.
+            self.ready.set()
             if control & 1:
                 if len(packet) != 2 or control & 0xc062:
                     raise ValueError('Malformed ERTM supervisory frame')
                 function = (control >> 2) & 3
                 self.remote_busy = function == 2
-                if function in (1, 3) and self.pending:
-                    seq, data = self.pending
-                    self.raw_send((seq << 1) | (self.rx_seq << 8), data)
+                if function == 1:
+                    self.retransmit(tuple(self.unacknowledged))
+                elif function == 3:
+                    data = next((data for seq, data in self.unacknowledged if seq == ack),
+                                self.history.get(ack))
+                    if data is not None:
+                        self.retransmit(((ack, data),))
                 if control & 0x10:
                     self.rr(final=True)
                 return
@@ -71,39 +101,76 @@ class Ertm:
     def fail(self, error):
         if self.error is None:
             self.error = error
+            if self.timer and self.timer is not asyncio.current_task():
+                self.timer.cancel()
             self.ready.set()
             if not self.incoming.full():
                 self.incoming.put_nowait(error)
 
-    async def wait_ack(self):
+    async def retransmission_timer(self):
+        try:
+            while self.unacknowledged:
+                await asyncio.sleep(1)
+                if not self.unacknowledged:
+                    return
+                elapsed = time.monotonic() - self.last_progress
+                if elapsed >= self.timeout:
+                    raise TimeoutError('ERTM receiver did not acknowledge frame')
+                if elapsed >= 1:
+                    if not self.remote_busy:
+                        self.retransmit(tuple(self.unacknowledged))
+                    self.rr(poll=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.fail(error)
+
+    async def wait_available(self, drain=False):
         deadline = time.monotonic() + self.timeout
-        while not self.ready.is_set() or self.remote_busy:
+        while self.remote_busy or (bool(self.unacknowledged) if drain else len(self.unacknowledged) >= self.window):
+            if self.closed:
+                raise ConnectionError('ERTM channel is closed')
             if self.error:
                 raise self.error
             if time.monotonic() >= deadline:
                 raise TimeoutError('ERTM receiver did not acknowledge frame')
+            self.ready.clear()
             try:
                 await asyncio.wait_for(self.ready.wait(), 1)
             except TimeoutError:
-                if self.pending and not self.remote_busy:
-                    seq, previous = self.pending
-                    self.raw_send((seq << 1) | (self.rx_seq << 8), previous)
-                self.rr(poll=True)
-            if self.remote_busy:
-                self.rr(poll=True)
-                await asyncio.sleep(.1)
+                if self.remote_busy:
+                    self.rr(poll=True)
         if self.error:
             raise self.error
 
+    async def wait_ack(self):
+        await self.wait_available(drain=True)
+
     async def send(self, data):
+        if self.closed:
+            raise ConnectionError('ERTM channel is closed')
+        if len(data) > self.mps:
+            raise ValueError('ERTM payload exceeds MPS')
         async with self.lock:
-            await self.wait_ack()
+            await self.wait_available()
             seq = self.tx_seq
             self.tx_seq = (seq + 1) % 64
-            self.pending = seq, bytes(data)
-            self.ready.clear()
+            if not self.unacknowledged:
+                self.last_progress = time.monotonic()
+            self.unacknowledged.append((seq, bytes(data)))
             self.raw_send((seq << 1) | (self.rx_seq << 8), data)
-            await self.wait_ack()
+            self.tx_frames += 1
+            if self.timer is None or self.timer.done():
+                self.timer = asyncio.create_task(self.retransmission_timer())
+            if self.window == 1:
+                await self.wait_ack()
+
+    async def close(self):
+        self.closed = True
+        self.ready.set()
+        if self.timer:
+            self.timer.cancel()
+            await asyncio.gather(self.timer, return_exceptions=True)
 
     async def receive(self):
         if self.error:
@@ -120,6 +187,7 @@ class RelayLink:
         self.stream = Stream()
         self.messages = asyncio.Queue(maxsize=256)
         self.on_message = None
+        self.on_error = None
         self.deferred = []
         self.send_lock = asyncio.Lock()
         self.task = asyncio.create_task(self.read_loop())
@@ -135,6 +203,8 @@ class RelayLink:
             raise
         except Exception as error:
             self.ertm.fail(error)
+            if self.on_error:
+                self.on_error(error)
             await self.messages.put(error)
 
     async def send_message(self, kind, payload):
@@ -142,8 +212,9 @@ class RelayLink:
         # NRLP is one byte stream: another sender must not splice a message
         # between ERTM chunks of this one.
         async with self.send_lock:
-            for offset in range(0, len(wire), 1000):
-                await self.ertm.send(wire[offset:offset + 1000])
+            mps = getattr(self.ertm, 'mps', 1000)
+            for offset in range(0, len(wire), mps):
+                await self.ertm.send(wire[offset:offset + mps])
 
     async def send(self, packet):
         await self.send_message(4, packet)
@@ -179,3 +250,5 @@ class RelayLink:
     async def close(self):
         self.task.cancel()
         await asyncio.gather(self.task, return_exceptions=True)
+        if close := getattr(self.ertm, 'close', None):
+            await close()

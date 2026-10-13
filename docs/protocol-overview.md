@@ -120,6 +120,15 @@ sequenceDiagram
     C->>W: ESP-protected NWSC signed service request and IDS Hello
     W-->>C: Protected peer feedback, Hello and data-lane setup
     C->>K: Authenticate/decrypt incoming ESP and deliver IPv6 packets
+    rect rgb(240, 248, 255)
+    Note over C,W: Internet relay enabled by default
+        C->>W: IKE INFORMATIONAL ProxyNotify 0xC60D: IPv6, port 62742, forwarding criteria
+        W-->>C: Encrypted IKE receipt
+        W->>K: TCP Shoes request naming target host, port and service
+        K->>C: Accept proxy stream
+        C->>A: Open requested upstream TCP connection
+        Note over C,W: Relay TLS bytes unchanged in both directions#59; receipt alone is not download success
+    end
     C->>W: Mutual IDS device-info exchange (commands 11/12)
     W-->>C: Device-info response and receipts
     Note over C,W: IDS device info exchanges pairing identities#59; it does not sign into an Apple Account
@@ -146,10 +155,12 @@ sequenceDiagram
 ## Limits
 
 App sync is partial. The companion announces the default app list over the
-app-sync conduit. The Watch uses its own Wi-Fi to download apps.
-Automatic installation is untested.
+app-sync conduit. The opt-in Shoes relay provides an Internet path through the
+companion; the Watch may also have its own Wi-Fi path. Successful app installation
+and software updates have not been established.
 
 Activation requests use the host's Internet connection.
-The companion does not provide a general Internet relay for the Watch.
-Software updates and Apple Account sign-in are not implemented.
+The Shoes proxy supports observed TCP framing, not MASQUE or general IP forwarding.
+Software-update messages are logged for diagnosis; a companion-driven update
+manager and Apple Account sign-in are not implemented.
 An Activation Lock ownership challenge is not successful activation.

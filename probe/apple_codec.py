@@ -50,7 +50,9 @@ def timesync_clock_replies(request, unix_seconds, monotonic_seconds):
     return [bplist({TM_MSG: 9, 'kTMLSLinkRTCKey': mach / 1e9, 'kTMLSLinkRemoteRTCKey': float(rtc),
                     'kTMLSLinkUncertaintyKey': error + 0.001}),
             bplist({TM_MSG: 1, 'kTMLSLinkTimeKey': unix_seconds - 978307200.0, 'kTMLSLinkRTCKey': monotonic_seconds,
-                    'kTMLSLinkUncertaintyKey': 0.1, 'kTMLSLinkSourceKey': 'TMLSSourceDevice',
+                    # Watch LinkSource 23T240 accepts only Computed/ComputedReliable
+                    # for time updates (0x37c0..0x37f4); Device is for the zone.
+                    'kTMLSLinkUncertaintyKey': 0.1, 'kTMLSLinkSourceKey': 'TMLSSourceComputed',
                     'kTMLSLinkReliableKey': False})]
 
 

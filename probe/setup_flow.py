@@ -1,5 +1,6 @@
 """Initial NanoRegistry, activation and native PairedSync setup state machine."""
 import base64
+import hashlib
 from pathlib import Path
 import plistlib
 import re
@@ -13,6 +14,89 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from apple_codec import (APPSYNC, CREDS, TIMESYNC, NANO_C, NANO_D, PBB, PREFS, PSY,
     timesync_clock_replies, timesync_message_type, timesync_state_replies, apple_time,
     archive, bplist, decode_nr_properties, field, nr_properties, one, preferences, protobuf, sync_state)
+
+
+def service_diagnostics(payload, depth=0):
+    """Envelope/error metadata only; no raw bodies, descriptions or credentials."""
+    try:
+        value = plistlib.loads(payload)
+    except Exception:
+        try:
+            fields = protobuf(payload)
+            return {'payload_format': 'protobuf',
+                    'field_summary': {str(tag): {'count': len(items),
+                                                'numbers': [v for v in items[:8] if type(v) in (int, bool)],
+                                                'byte_lengths': [len(v) for v in items[:8] if isinstance(v, bytes)]}
+                                      for tag, items in list(fields.items())[:32]}}
+        except Exception:
+            return {'payload_format': 'opaque'}
+    if not isinstance(value, dict):
+        return {'payload_format': 'plist', 'root_type': type(value).__name__}
+    keys = sorted(k for k in value if isinstance(k, str) and
+                  re.fullmatch(r'[A-Za-z_$][A-Za-z0-9_.$-]{0,95}', k))[:64]
+    summary = {'payload_format': 'plist', 'keys': keys,
+               'field_types': {key: type(value[key]).__name__ for key in keys},
+               'numeric_fields': {key: value[key] for key in keys
+                                  if key in ('T', 'E', 'EO', 'command', 'type', 'operation', 'messageType',
+                                             'errorCode', 'error-code', 'code', 'status', 'success')
+                                  and type(value[key]) in (int, bool)}}
+    if isinstance(value.get('MessageType'), str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9]{0,63}', value['MessageType']):
+        summary['message_type'] = value['MessageType']
+    if isinstance(value.get('BI'), str) and re.fullmatch(r'com\.apple\.[A-Za-z0-9_.-]{1,100}', value['BI']):
+        summary['bundle_id'] = value['BI']
+    if isinstance(value.get('ED'), str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,127}', value['ED']):
+        summary['error_domain'] = value['ED']
+    if 'EM' in value:
+        summary['error_description_type'] = type(value['EM']).__name__
+        if isinstance(value['EM'], (str, bytes)):
+            summary['error_description_length'] = len(value['EM'])
+    if isinstance(value.get('EO'), bytes):
+        summary['error_object_length'] = len(value['EO'])
+        if depth < 2 and len(value['EO']) <= 65536:
+            summary['error_details'] = service_diagnostics(value['EO'], depth + 1)
+    # OTA ScanResult carries an archived SUBDescriptor and/or NSError under these keys.
+    if 'Descriptor' in value:
+        summary['descriptor_present'] = True
+        summary['descriptor_type'] = type(value['Descriptor']).__name__
+        if isinstance(value['Descriptor'], (bytes, str, list, dict)):
+            summary['descriptor_length'] = len(value['Descriptor'])
+    if isinstance(value.get('Error'), bytes):
+        summary['error_field_length'] = len(value['Error'])
+        if depth < 2 and len(value['Error']) <= 65536:
+            summary['error_field_details'] = service_diagnostics(value['Error'], depth + 1)
+    summary['collection_counts'] = {key: len(value[key]) for key in ('BL', 'IL', 'RA')
+                                    if isinstance(value.get(key), (list, dict))}
+    if type(value.get('RS')) in (int, bool):
+        summary['numeric_fields']['RS'] = value['RS']
+    # NSKeyedArchiver errors store codes/domains in $objects, sometimes through UIDs.
+    objects = value.get('$objects')
+    if isinstance(objects, list):
+        errors = []
+        for obj in objects[:256]:
+            if not isinstance(obj, dict) or type(obj.get('NSCode')) is not int:
+                continue
+            error = {'code': obj['NSCode']}
+            domain = obj.get('NSDomain')
+            if isinstance(domain, plistlib.UID) and domain.data < len(objects):
+                domain = objects[domain.data]
+            if isinstance(domain, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,127}', domain):
+                error['domain'] = domain
+                if domain == 'com.apple.MobileAssetError.Download':
+                    # Watch23T240 MobileAsset _stringForMADownloadResult table.
+                    name = {47: 'MADownloadNetworkingError',
+                            53: 'MADownloadTimedOutResource',
+                            65: 'MADownloadNotConnectedToInternet'}.get(obj['NSCode'])
+                    if name:
+                        error['result_name'] = name
+            if domain == 'SUBError' and obj['NSCode'] == 34:
+                # Watch23T240 nanosubridged error builder at 0x1000356ac.
+                error['reason'] = 'Update requires companion update'
+            errors.append(error)
+            if len(errors) == 8:
+                break
+        summary['archived_errors'] = errors
+    return summary
+
 
 
 def public_identity(signing, encryption):
@@ -124,6 +208,17 @@ class SetupFlow:
         version = self.ids.peer_hello['maximum'] or 26
         return field(1, state) + field(2, 26) + field(3, version) + field(4, 25)
 
+    def diagnostic_status(self):
+        values = {'watch_is_setup': self.is_setup, 'watch_setup_present': 'isSetup' in self.watch,
+                'activation': self.activation,
+                'sync_complete': self.sync_complete, 'completion_ack': self.completion_ack,
+                'watch_sync_progress': self.sync_values.get('PSYWatchSyncState', {}).get('syncProgressState'),
+                'watch_global_progress': self.sync_values.get('PSYWatchSyncState', {}).get('globalProgress'),
+                'client_sync_progress': self.sync_values.get('PSYWatchSyncClientState', {}).get('syncProgressState')}
+        return {key: value if type(value) in (bool, int, float) else None
+                for key, value in values.items()}
+
+
     async def run(self):
         await self.ids.wait_transport_quiet()
         await self.ids.send(CREDS, None, bplist({'command': 11, 'unique-id': self.request_id}))
@@ -171,6 +266,15 @@ class SetupFlow:
             await self.timesync(message)
         elif topic == APPSYNC:
             await self.app_sync(message)
+        elif topic == 'com.apple.private.alloy.otaupdate':
+            self.record('ota_message_received', type=kind, length=len(payload),
+                        response=bool(message.get('response')),
+                        response_expected=bool(message['flags'] & 1),
+                        has_peer=bool(message.get('peer')),
+                        message_fingerprint=hashlib.sha256(message['id'].upper().encode()).hexdigest()[:16],
+                        peer_fingerprint=hashlib.sha256(message['peer'].upper().encode()).hexdigest()[:16]
+                                         if message.get('peer') else None,
+                        application_handler='not_implemented', **service_diagnostics(payload))
         elif topic in (NANO_C, NANO_D):
             if kind == 4 and not message['response']:
                 await self.ids.send(topic, 4, nr_properties(self.phone, response=True), peer=message['id'], response=True)
@@ -225,6 +329,14 @@ class SetupFlow:
                         response_expected=bool(message['flags'] & 1), correlated=bool(message['peer']))
         except Exception:
             self.record('app_sync_message', message_type=None, keys=[], response_expected=bool(message['flags'] & 1))
+        self.record('app_sync_diagnostic', length=len(message['payload']),
+                    response=bool(message.get('response')),
+                    response_expected=bool(message['flags'] & 1),
+                    has_peer=bool(message.get('peer')),
+                    message_fingerprint=hashlib.sha256(message['id'].upper().encode()).hexdigest()[:16],
+                    peer_fingerprint=hashlib.sha256(message['peer'].upper().encode()).hexdigest()[:16]
+                                     if message.get('peer') else None,
+                    **service_diagnostics(message['payload']))
         if self.app_sync_sent:
             return
         self.app_sync_sent = True
@@ -236,15 +348,24 @@ class SetupFlow:
     async def timesync(self, message):
         kind = timesync_message_type(message['payload'])
         self.record('timesync_received', message_type=kind, expects_response=bool(message['flags'] & 1))
+        now, monotonic = time.time(), time.monotonic()
         if kind == 6:
             replies = timesync_state_replies(self.timezone)
         elif kind == 8:
-            replies = timesync_clock_replies(message['payload'], time.time(), time.monotonic())
+            values = plistlib.loads(message['payload'])
+            self.record('timesync_clock_sample',
+                        remote_mach=values.get('kTMLSLinkRemoteMachKey'),
+                        remote_rtc=values.get('kTMLSLinkRTCKey'),
+                        uncertainty=values.get('kTMLSLinkUncertaintyKey'),
+                        host_unix=now, host_monotonic=monotonic, timezone=self.timezone)
+            replies = timesync_clock_replies(message['payload'], now, monotonic)
         else:
             return
         for reply in replies:
             await self.ids.send(TIMESYNC, None, reply)
-        self.record('timesync_answered', message_type=kind, replies=len(replies))
+        self.record('timesync_answered', message_type=kind, replies=len(replies),
+                    host_unix=now, host_monotonic=monotonic, timezone=self.timezone,
+                    time_source='TMLSSourceComputed' if kind == 8 else None)
 
     async def account_request(self, values):
         """Local IDS account RPCs: this companion has no Apple Account, so fetch gets empty accounts and sync is refused.

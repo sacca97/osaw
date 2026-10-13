@@ -122,8 +122,10 @@ class Tun:
             os.close(self.fd)
             raise
 
-    def start(self, on_packet, on_error):
+    def start(self, on_packet, on_error, record=None):
         self.queue = asyncio.Queue(maxsize=256)
+        self.read_paused = False
+        self.backpressure_count = 0
         def failed(error):
             if self.error is None:
                 self.error = error
@@ -133,6 +135,13 @@ class Tun:
             try:
                 packet = os.read(self.fd, 65536)
                 self.queue.put_nowait(packet)
+                if self.queue.full():
+                    asyncio.get_running_loop().remove_reader(self.fd)
+                    self.read_paused = True
+                    self.backpressure_count += 1
+                    if record and self.backpressure_count & (self.backpressure_count - 1) == 0:
+                        record('normal_tun_backpressure', count=self.backpressure_count,
+                               queued_packets=self.queue.qsize())
             except BlockingIOError:
                 pass
             except Exception as error:
@@ -140,7 +149,11 @@ class Tun:
         async def pump():
             try:
                 while True:
-                    await on_packet(await self.queue.get())
+                    packet = await self.queue.get()
+                    if self.read_paused and self.error is None:
+                        asyncio.get_running_loop().add_reader(self.fd, readable)
+                        self.read_paused = False
+                    await on_packet(packet)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -171,6 +184,9 @@ class NormalLink:
         self.tun = None
         self.accept_ip = False
         self.request_cache = {}
+        # Authentication consumed D IDs 2..4 and C ID 2.
+        self.next_notify_id = {'d': 5, 'c': 3}
+        self.seen_tcp = set()
         self.local_prelude, self.remote_prelude = local_prelude, remote_prelude
         self.error = self.on_error = None
 
@@ -183,6 +199,7 @@ class NormalLink:
 
     async def start(self):
         self.link.on_message = self.incoming
+        self.link.on_error = self.fail
         for lane in ('d', 'c'):
             session = OrdinarySession(self.link, self.record, self.store, lane, self.local_prelude, self.remote_prelude)
             await session.establish()
@@ -194,7 +211,7 @@ class NormalLink:
         if class_c(d.local_address) != c.local_address or class_c(d.remote_address) != c.remote_address:
             raise ValueError('Class-C/D address assignments disagree')
         self.tun = Tun(d.local_address, d.remote_address, c.local_address, c.remote_address)
-        self.tun.start(self.outgoing, self.fail)
+        self.tun.start(self.outgoing, self.fail, self.record)
         self.store.save(stage='normal_link_ready')
         self.record('normal_link_ready', interface=self.tun.name)
 
@@ -210,7 +227,9 @@ class NormalLink:
         d = self.sessions['d']
         self.record('link_director_announcements_started')
         identifier = time.time_ns() // 1000 - time.monotonic_ns() // 2000
-        for mid, kind, value in ((5, 1, b''), (6, 6, b'\x01')):
+        for kind, value in ((1, b''), (6, b'\x01')):
+            mid = self.next_notify_id['d']
+            self.next_notify_id['d'] += 1
             message = struct.pack('>BBHIQ', 2, 0, 3 + len(value), 0, identifier) + bytes([kind]) + struct.pack('>H', len(value)) + value
             first, plain = await d.exchange(37, mid, 41, chain([(41, notify(0xc60e, message))]))
             if first or plain:
@@ -225,6 +244,49 @@ class NormalLink:
             packet = struct.pack('>IHBB', 0x60000000, len(payload), 58, 255) + source + destination + payload
             await self.outgoing(packet)
             self.record('normal_neighbor_advertised', lane=lane)
+
+    async def announce_proxy(self, address, port):
+        """Experimental legacy C60D endpoint; an IKE receipt proves delivery only."""
+        address = ipaddress.IPv6Address(address)
+        if address.packed not in [session.local_address for session in self.sessions.values()]:
+            raise ValueError('Proxy endpoint must belong to the normal link')
+        if not 1 <= port <= 65535:
+            raise ValueError('Invalid proxy port')
+        lane = 'c' if 'c' in self.sessions else 'd'
+        mid = self.next_notify_id[lane]
+        self.next_notify_id[lane] += 1
+        # Native NRTLV tag 51: uint64 flags, bit 0 = forwardNonMatchingTraffic.
+        criteria = struct.pack('>BHQ', 51, 8, 1)
+        body = address.packed + struct.pack('>H', port) + criteria
+        fields = dict(lane=lane, message_id=mid, notify=0xc60d,
+                      endpoint=str(address), port=port, proxy_flags=1, length=len(body))
+        self.record('proxy_announcement_sent', **fields)
+        first, plain = await self.sessions[lane].exchange(37, mid, 41, chain([(41, notify(0xc60d, body))]))
+        if first or plain:
+            raise ValueError('Expected empty proxy announcement receipt')
+        self.record('proxy_announcement_acknowledged', **fields, ike_ack=True)
+
+    def note_tcp(self, packet):
+        """Record each distinct Watch flow once, so any gateway target/port is visible."""
+        if len(self.seen_tcp) >= 256:
+            return
+        next_header = packet[6]
+        if next_header == 6:
+            event, protocol = 'watch_tcp_flow', 'tcp'
+        elif next_header == 17:
+            event, protocol = 'watch_udp_flow', 'udp'
+        else:
+            return
+        if len(packet) < 44:
+            return
+        key = (packet[24:40], next_header, int.from_bytes(packet[42:44], 'big'))
+        if key in self.seen_tcp:
+            return
+        self.seen_tcp.add(key)
+        self.record(event, protocol=protocol,
+                    destination=str(ipaddress.IPv6Address(packet[24:40])), port=key[2],
+                    source=str(ipaddress.IPv6Address(packet[8:24])),
+                    source_port=int.from_bytes(packet[40:42], 'big'))
 
     async def incoming(self, kind, data):
         if kind == 4:
@@ -266,6 +328,18 @@ class NormalLink:
             self.record('network_relay_control', length=len(data))
             return True
         if kind == 2:
+            if data and data[0] >> 4 == 4:
+                # NRLP type 2 carries either IP version. This tunnel supports
+                # IPv6 ESP only; unsupported IPv4 packets must not abort it.
+                header_length = (data[0] & 15) * 4
+                if (len(data) < 20 or header_length < 20 or header_length > len(data)
+                        or int.from_bytes(data[2:4], 'big') != len(data)):
+                    raise ValueError('Invalid NRLP IPv4 envelope')
+                self.unsupported_ipv4 = getattr(self, 'unsupported_ipv4', 0) + 1
+                if self.unsupported_ipv4 <= 8:
+                    self.record('normal_ipv4_unsupported_dropped', length=len(data),
+                                protocol=data[9], count=self.unsupported_ipv4)
+                return True
             packet = data
         elif 100 <= kind <= 105:
             lane = 'c' if kind >= 104 else 'd'
@@ -299,6 +373,7 @@ class NormalLink:
         clear = session.esp.open(packet)
         if clear is None or multicast:
             return True
+        self.note_tcp(clear)
         if self.tun and self.accept_ip:
             self.tun.deliver(clear)
         else:

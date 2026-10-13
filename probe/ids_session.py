@@ -107,7 +107,7 @@ class IdsSession:
             await writer.drain()
 
     async def wait_transport_quiet(self, minimum_wait=0):
-        """Runtime pacing: wait for queued/unacknowledged TCP before setup."""
+        """Bounded pacing; background traffic must not block application handling."""
         started = asyncio.get_running_loop().time()
         while True:
             if self.error:
@@ -128,9 +128,13 @@ class IdsSession:
             elapsed = asyncio.get_running_loop().time() - started
             if queued == 0 and outstanding <= 1 and elapsed >= minimum_wait:
                 self.record('ids_transport_quiet', tcp_pending=0, ertm_pending=outstanding)
-                return
+                return True
             if elapsed >= self.timeout:
                 raise TimeoutError('IDS transport did not become quiet for setup')
+            if elapsed >= max(1.0, minimum_wait):
+                self.record('ids_transport_busy', tcp_pending=queued,
+                            ertm_pending=outstanding, waited_seconds=elapsed)
+                return False
             await asyncio.sleep(0.01)
 
     async def connect(self, lane, port):
