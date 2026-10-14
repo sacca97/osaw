@@ -3,7 +3,7 @@
 import argparse
 import asyncio
 import math
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from datetime import datetime, timezone
 import getpass
 import json
@@ -11,8 +11,10 @@ import logging
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import struct
 import sys
+import threading
 import time
 from magnet_probe import MAGNET_CID, magnet, parse_magnet, positive_seconds
 
@@ -132,6 +134,8 @@ async def run(args):
     from ids_session import IdsSession
     from relay_proxy import RelayProxy
     from setup_flow import SetupFlow
+    from operational import Operational
+    from health_inbox import reset_health_data
     from watch_link import Ertm, RelayLink
 
     os.umask(0o077)
@@ -142,8 +146,10 @@ async def run(args):
         if data.get('bonded') and data.get('peer_address') and data.get('watch_product'):
             saved.append(path)
     saved.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
-    choice = 0
-    if saved:
+    if args.resume and not saved:
+        raise ValueError('No saved authenticated Watch bond found under probe/runs/')
+    choice = 1 if args.resume else 0
+    if saved and not args.resume:
         print('0. Pair a reset Watch (preserves existing bonds)', flush=True)
         for number, path in enumerate(saved, 1):
             data = json.loads(path.read_text())
@@ -181,9 +187,40 @@ async def run(args):
         library_log.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
         logging.getLogger().addHandler(library_log)
         files.callback(logging.getLogger().removeHandler, library_log)
+        use_tui = (sys.stdin.isatty() and sys.stdout.isatty()
+                   and os.environ.get('TERM', 'dumb') not in ('', 'dumb'))
+        ui_task = None
+        ui_stop = threading.Event()
+        run_task = asyncio.current_task()
+        console_log = private_file('console.log', 'w') if use_tui else None
+        if use_tui:
+            # Keep verbose logger handlers off the terminal, including during PIN entry.
+            for handler in logging.getLogger().handlers:
+                if isinstance(handler, logging.StreamHandler) and handler.stream in (sys.stdout, sys.stderr):
+                    original_stream = handler.setStream(console_log)
+                    files.callback(handler.setStream, original_stream)
+
+        def start_tui():
+            nonlocal ui_task
+            if not use_tui or ui_task is not None:
+                return
+            import curses
+            from monitor_run import Monitor
+            from watch_tui import draw
+            # curses uses the original terminal; Python prints go to the private log.
+            files.enter_context(redirect_stdout(console_log))
+            files.enter_context(redirect_stderr(console_log))
+            ui_task = asyncio.create_task(asyncio.to_thread(
+                curses.wrapper, draw, Monitor(run_dir), ui_stop, True))
+
+            def ui_closed(task):
+                if not ui_stop.is_set() and not stay_disconnected:
+                    run_task.cancel()
+            ui_task.add_done_callback(ui_closed)
         status_labels = {
             'start': 'Starting companion',
             'controller_ready': 'Bluetooth controller ready',
+            'companion_disconnected': 'Watch disconnected; companion remains open (q to quit)',
             'finding_bonded_watch': 'Connecting to saved Watch',
             'watch_selected': 'Watch selected',
             'channel_accepted': 'Watch transport connected',
@@ -199,11 +236,16 @@ async def run(args):
             'watch_activation_confirmed': 'Watch activation confirmed',
             'setup_protocol_complete': 'Watch setup confirmed',
             'reconnected_to_initialized_watch': 'Reconnected to initialized Watch',
+            'health_bootstrap_ready': 'Health negotiation ready',
+            'health_restore_request_sent': 'Health Restore request sent',
+            'health_restore_accepted': 'Watch accepted Health Restore',
         }
         displayed_status = set()
         def record(event, **fields):
             events.write(json.dumps({'event': event, 'epoch': time.time(), **fields}) + '\n')
             events.flush()
+            if use_tui:
+                return  # The TUI owns the screen; complete events remain in events.jsonl.
             if not args.verbose:
                 label = status_labels.get(event)
                 if event == 'timesync_answered' and fields.get('message_type') == 8:
@@ -253,7 +295,11 @@ async def run(args):
         relay_proxy = None
         heartbeat_task = None
         setup_flow = None
+        operational = None
         handlers = {}
+        link_lost = False
+        closing_link = False
+        stay_disconnected = False
         async def heartbeat():
             while True:
                 await asyncio.sleep(10)
@@ -271,6 +317,10 @@ async def run(args):
                            **setup_flow.diagnostic_status()}
                           if setup_flow else {}))
         try:
+            # Also discard leftovers from a previous process killed before cleanup.
+            reset_health_data(store, record)
+            if args.resume:
+                start_tui()
             transport = await open_transport(args.transport)
             await transport.__aenter__()
             address = Address(store.key('host_address').hex()) if store else Address.generate_static_address()
@@ -386,8 +436,15 @@ async def run(args):
             # its resolution scan currently does not apply connect's timeout.
             connection = await asyncio.wait_for(device.connect(peer, timeout=args.timeout), args.timeout)
             def disconnected(*details):
+                nonlocal link_lost
+                if closing_link or link_lost:
+                    return
+                link_lost = True
+                record('companion_disconnected', source='bluetooth',
+                       reason=details[0] if details and isinstance(details[0], int) else None)
                 error = ConnectionError('Watch disconnected')
-                incoming.put_nowait(error)
+                if not incoming.full():
+                    incoming.put_nowait(error)
                 for handler in handlers.values():
                     handler.fail(error)
                 if ids:
@@ -491,6 +548,7 @@ async def run(args):
                 await pairing_link.close()
                 pairing_link = None
                 ertm = await channel(2, 65, 'com.apple.terminusLink', added=True)
+            start_tui()  # All interactive selection/PIN prompts have finished.
             signal_task = asyncio.create_task(expected(None))
             def signal_done(task):
                 if not task.cancelled() and task.exception():
@@ -504,7 +562,7 @@ async def run(args):
             await ertm.send(local)
             remote = await asyncio.wait_for(ertm.receive(), args.timeout)
             accept_prelude(remote, local)
-            record('normal_prelude_accepted')
+            record('normal_prelude_accepted', flags=int.from_bytes(remote[34:36], 'big'))
             relay = RelayLink(ertm, record, args.timeout)
             normal = NormalLink(relay, record, store, local, remote)
             await normal.start()
@@ -543,28 +601,58 @@ async def run(args):
                 record('proxy_announcement_failed', error=type(error).__name__,
                        endpoint=endpoint, port=relay_proxy.port, ike_ack=False)
                 # Keep the diagnostic session alive to observe late Watch flows.
-            proxy = ActivationProxy(record, store.directory)
+            proxy = ActivationProxy(record, store.directory, args.activation_lock)
             setup_flow = SetupFlow(ids, store, record, proxy, product, args.language, args.locale, args.timezone)
-            async with asyncio.timeout(None if args.setup_timeout == math.inf else args.setup_timeout):
-                await setup_flow.run()
+            operational = Operational(setup_flow, run_dir)
+            setup_flow.operational = operational
+            try:
+                await operational.start()
+            except OSError as error:
+                record('operational_controls_failed', error=type(error).__name__)
+            await setup_flow.run(None if args.setup_timeout == math.inf else args.setup_timeout)
             print(('Watch confirmed its initialized setup.' if setup_flow.reconnecting else
                    'Watch reported activation, isSetup and initial-sync completion.') +
                   ' Check the watch face and open built-in apps; physical usability is still unverified.', flush=True)
             if args.hold:
                 print('Keeping the companion connected until interrupted.' if args.hold == math.inf else
                       f'Keeping the companion connected for {args.hold:g} seconds.', flush=True)
-                try:
-                    async with asyncio.timeout(None if args.hold == math.inf else args.hold):
-                        while True:
-                            await setup_flow.accept(await ids.receive())
-                            await setup_flow.advance()
-                except TimeoutError:
-                    if ids.error:
-                        raise ids.error
+                hold_deadline = None if args.hold == math.inf else time.monotonic() + args.hold
+                while True:
+                    remaining = None if hold_deadline is None else hold_deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        break
+                    message = await setup_flow.receive_or_advance(remaining)
+                    if message is not None:
+                        await setup_flow.accept(message)
+                        await setup_flow.advance()
         except BaseException as error:
-            record('aborted', error=type(error).__name__, message=str(error))
-            raise
+            if isinstance(error, asyncio.CancelledError) and ui_task and ui_task.done() and not ui_task.cancelled():
+                ui_error = ui_task.exception()
+                if ui_error is None:
+                    record('companion_stopped', source='tui')
+                    return
+                record('aborted', error=type(ui_error).__name__, message=str(ui_error))
+                raise RuntimeError(f'TUI stopped: {type(ui_error).__name__}; logs: {run_dir}') from ui_error
+            if (isinstance(error, Exception) and connection is not None
+                    and (link_lost or isinstance(error, (ConnectionError, EOFError)))):
+                # A closed IDS stream can arrive before the HCI disconnect event.
+                stay_disconnected = True
+                if not link_lost:
+                    record('companion_disconnected', source='stream', error=type(error).__name__)
+                if ids:
+                    ids.fail(error)
+                    ids.phase = 'disconnected'
+            else:
+                record('aborted', error=type(error).__name__, message=str(error))
+                raise
         finally:
+            closing_link = True
+            if not stay_disconnected:
+                ui_stop.set()
+                if ui_task:
+                    await asyncio.gather(ui_task, return_exceptions=True)
+                if operational:
+                    await operational.close()
             if heartbeat_task:
                 heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
@@ -578,7 +666,7 @@ async def run(args):
             for resource in (ids, normal, relay, pairing_link):
                 if resource:
                     try:
-                        await resource.close()
+                        await asyncio.wait_for(resource.close(), 5)
                     except Exception as error:
                         record('cleanup_failed', resource=type(resource).__name__, error=type(error).__name__)
             if connection:
@@ -592,8 +680,33 @@ async def run(args):
                     if path.exists():
                         user_owned(path)
             if transport:
-                await transport.__aexit__(None, None, None)
+                try:
+                    await transport.__aexit__(None, None, None)
+                except Exception as error:
+                    record('cleanup_failed', resource='transport', error=type(error).__name__)
             snoop.flush()
+            try:
+                reset_health_data(store, record)
+            except (OSError, ValueError, sqlite3.Error) as error:
+                record('health_reset_failed', error=type(error).__name__)
+            if stay_disconnected:
+                # Keep local status/history available; never reconnect or replay writes.
+                if ids:
+                    ids.lanes.clear()
+                record('progress', stage='disconnected', ids_phase='disconnected',
+                       ids_lanes=0, ertm_pending=0)
+                try:
+                    if ui_task:
+                        await asyncio.shield(ui_task)
+                    else:
+                        await asyncio.Event().wait()
+                finally:
+                    ui_stop.set()
+                    if ui_task:
+                        await asyncio.gather(ui_task, return_exceptions=True)
+                    if operational:
+                        await operational.close()
+                    record('companion_stopped', source='tui' if ui_task else 'interrupt')
 
 
 def main():
@@ -602,7 +715,9 @@ def main():
                         help='Linux HCI transport (default: hci-socket:0)')
     parser.add_argument('--connection-interval-ms', type=float, choices=(7.5, 15.0, 30.0),
                         help='Request a shorter BLE interval; rejection preserves the current link')
-    parser.set_defaults(scan=False, peer=None, resume=False, proxy_probe=True,
+    parser.add_argument('--resume', action='store_true',
+                        help='Reconnect using the latest saved bond without prompting')
+    parser.set_defaults(scan=False, peer=None, proxy_probe=True,
                         verbose=os.environ.get('OSAW_VERBOSE') == '1',
                         ertm_window=32, ertm_mps=2042,
                         output=Path(__file__).resolve().parent / 'runs',

@@ -19,6 +19,11 @@ class Monitor:
         self.milestones = []
         self.last_protocol = self.heartbeat = self.started = None
         self.event_count, self.bad_events = 0, 0
+        self.event_counts = Counter()
+        self.health_messages = self.health_observations = 0
+        self.health_state = 'not observed'
+        self.stopped = False
+        self.disconnected = False
 
     def refresh(self):
         with (self.directory / 'events.jsonl').open() as events:
@@ -34,6 +39,16 @@ class Monitor:
                     continue
                 self.event_count += 1
                 name = event.get('event', '?')
+                self.event_counts[name] += 1
+                if name in ('aborted', 'companion_stopped'):
+                    self.stopped = True
+                if name == 'companion_disconnected':
+                    self.disconnected = True
+                if name.startswith('health_'):
+                    self.health_state = name.removeprefix('health_')
+                if name == 'health_message_staged':
+                    self.health_messages += 1
+                    self.health_observations += event.get('observed_samples', 0)
                 if name == 'start':
                     self.started = event
                 if name == 'progress':

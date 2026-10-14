@@ -79,7 +79,7 @@ def control_frame(body):
 
 def hello(device_id, instance_id):
     body = b'\x01' + b''.join(string(value, 2) for value in ('5', 'iPhone OS', '26.6', '23G71', 'iPhone18,1'))
-    body += struct.pack('>I', 26) + encode_tlvs({0: struct.pack('>I', 25), 1: struct.pack('>I', 26),
+    body += struct.pack('>I', 26) + encode_tlvs({0: struct.pack('>I', 25), 1: struct.pack('>I', 27),
         2: instance_id.bytes, 5: uuid.UUID(device_id).bytes, 3: struct.pack('>Q', 0xbff), 4: struct.pack('>H', 32)})
     return control_frame(body)
 
@@ -94,7 +94,7 @@ def parse_hello(body):
     if len(fields.get(2, b'')) != 16 or len(fields.get(5, b'')) != 16:
         raise ValueError('IDS Hello lacks peer identifiers')
     low, high = (int.from_bytes(fields.get(n, bytes(4)), 'big') for n in (0, 1))
-    if (low or high) and max(low, 25) > min(high, 26):
+    if (low or high) and max(low, 25) > min(high, 27):
         raise ValueError('IDS pairing compatibility ranges do not overlap')
     return {'profile': values, 'version': version, 'instance': uuid.UUID(bytes=fields[2]),
             'device': uuid.UUID(bytes=fields[5]), 'minimum': low, 'maximum': high}
@@ -158,7 +158,7 @@ def application(sequence, stream, topic, message_id, payload, protobuf_type=None
     return frame(3, prefix + struct.pack('>HHI', protobuf_type, int(response), len(payload)) + payload + tail)
 
 
-def parse_application(command, body, maps):
+def parse_application(command, body, maps, allow_unmapped=False):
     c = Cursor(body)
     sequence, stream, flags = c.number(4), c.number(2), c.number(1)
     if flags & ~0x3f:
@@ -168,7 +168,7 @@ def parse_application(command, body, maps):
     if peer:
         uuid.UUID(peer)
     topic = c.string() if flags & 16 else maps.get(stream)
-    if topic is None:
+    if topic is None and not allow_unmapped:
         raise ValueError('IDS topic has no ServiceMap')
     if flags & 16:
         maps[stream] = topic

@@ -1,5 +1,7 @@
 # NanoRegistry property snapshot of the companion iPhone, derived by analysis/extract_phone_profile.py
-source: decrypted pairing capture
+# from the author's own decrypted pairing capture. Identifiers (serial, UDID, IMEI/MEID, MAC addresses,
+# device name, advertising seed), locale, region and storage are not included.
+source: derived from the author's own iPhone NanoRegistry property snapshot (decrypted pairing capture)
 product: iPhone14,5
 property_names:
 - hwModelStr

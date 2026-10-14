@@ -33,8 +33,32 @@ def validate_url(url):
     return url
 
 
+class ActivationLockChallenge(RuntimeError):
+    """Apple answered the activation request with an Activation Lock owner challenge instead of an activation record."""
+
+
+def lock_owner_hint(body):
+    """The masked owner account shown on the challenge page (for the device owner on their own screen); not logged."""
+    text = re.sub(r'<[^>]+>', ' ', body.decode('utf-8', 'replace'))
+    match = re.search(r'[\w.+-]\u2022+[\w.+\u2022-]*@[\w.-]+', text)
+    return match.group(0) if match else None
+
+
+def reject_lock_challenge(body):
+    shape = classify_body(body)
+    if shape['kind'] == 'html-page' and ('activation lock' in shape['mentions'] or 'fmip' in shape['mentions']):
+        # Forwarding this page makes the Watch fail with "Failed to extract activation record".
+        hint = lock_owner_hint(body)
+        raise ActivationLockChallenge(
+            'Activation Lock: this Watch is locked to an Apple Account and Apple asked for its owner credentials'
+            + (f' (account hint {hint})' if hint else '')
+            + ". Remove the Watch from that account (iCloud.com > Find Devices, or Find My on the owner's iPhone) "
+              'and pair again. The page is saved next to the state files.')
+
+
 class ActivationProxy:
-    def __init__(self, record, directory=None):
+    def __init__(self, record, directory=None, lock_policy='stop'):
+        self.lock_policy = lock_policy  # 'stop' raises on an Activation Lock page, 'withhold' only does not forward it
         import httpx
         self.directory, self.count = Path(directory) if directory else None, 0
         self.httpx = httpx
@@ -84,6 +108,14 @@ class ActivationProxy:
                                 shape=classify_body(result),
                                 protocol=response.http_version, body_length=len(result),
                                 header_names=sorted(response_headers))
+                    try:
+                        reject_lock_challenge(result)
+                    except ActivationLockChallenge:
+                        if self.lock_policy != 'withhold':
+                            raise
+                        # Observation mode: nothing is forwarded to the Watch and nothing is fabricated.
+                        self.record('activation_lock_withheld', hint_present=lock_owner_hint(result) is not None)
+                        return None
                     # Exact application body, including XML whitespace and ordering.
                     return field(1, result) + field(2, archive(response_headers, ARCHIVE_KEY))
             except self.httpx.TransportError:

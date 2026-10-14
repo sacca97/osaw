@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import fcntl
 import ipaddress
+import os
 import secrets
 import socket
 import struct
@@ -10,7 +11,7 @@ import time
 import termios
 import uuid
 from cryptography.exceptions import InvalidSignature
-from apple_codec import CLASS_D_TOPICS, LIMIT
+from apple_codec import CLASS_D_TOPICS, CREDS, NANO_D, PREFS, LIMIT
 from ids_wire import (Cursor, application, control_frame, frame, hello, nwsc_accept, nwsc_probe, parse_nwsc_feedback,
                       nwsc_feedback, nwsc_start, parse_application, parse_hello,
                       parse_setup, setup_message, string)
@@ -43,7 +44,8 @@ class IdsSession:
         self.lane_joined = {lane: asyncio.Event() for lane in ('d', 'c')}
         self.maps, self.outgoing_maps = {}, {}
         self.inline_topic_counts = {}
-        self.sequence = 0
+        # Experiment: the Watch's own counter persists across reconnects (66, 67, 68, ...); restart-at-zero may be deduplicated.
+        self.sequence = int(os.environ.get('OSAW_IDS_SEQ_START', '0'))
         self.connector_sequence = time.time_ns() // 1000 - time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 2000
         self.closed = False
         self.error = None
@@ -727,7 +729,17 @@ class IdsSession:
             self.learn_peer_stream(stream, topic)
         elif command in (0, 3, 6, 22):
             # Inline topics describe the peer's receive mapping, not ours.
-            message = parse_application(command, body, dict(self.maps))
+            message = parse_application(command, body, dict(self.maps), allow_unmapped=True)
+            if message['topic'] is None:
+                # An unresolved service must not end unrelated companion traffic.
+                # Never guess its topic, deliver it or acknowledge it as handled.
+                self.record('ids_message_unmapped', lane=lane, command=command,
+                            stream=message['stream'], sequence=message['sequence'],
+                            flags=message['flags'], length=len(body),
+                            local_port=self.socket_tag(writer),
+                            incoming_streams=sorted(self.maps),
+                            transport_ack=False, application_ack=False)
+                return
             if message['flags'] & 16:
                 self.learn_peer_stream(message['stream'], message['topic'])
                 local_stream = self.local_stream_for(message['topic'])
@@ -800,6 +812,7 @@ class IdsSession:
         if stream > 65535:
             raise ValueError('IDS stream IDs exhausted')
         self.maps[stream] = topic
+        self.record('ids_local_stream_allocated', stream=stream, topic=topic)
         return stream
 
     async def send(self, topic, kind, payload=b'', flags=0, peer='', response=False, command=None, expiry=None):
@@ -807,10 +820,14 @@ class IdsSession:
             raise self.error
         lane = 'd' if topic in CLASS_D_TOPICS else 'c'
         writer = self.lanes[lane]
-        # Observed on a Watch SE 3: frames are acknowledged only when sent on the Default-priority sockets.
-        writer = self.transports.get(f'UTunDelivery-Default-Default-{lane.upper()}', writer)
+        # Live: the Watch acknowledges frames only on its Default-priority sockets (Urgent drew no ACK). Override: OSAW_IDS_SEND_PRIORITY=Urgent|Sync.
+        priority = os.environ.get('OSAW_IDS_SEND_PRIORITY', 'Default')
+        if priority and priority != 'Urgent':
+            writer = self.transports.get(f'UTunDelivery-Default-{priority}-{lane.upper()}', writer)
         seq, identifier, stream = self.allocate(), str(uuid.uuid4()).upper(), self.stream_for(topic)
         include_topic = topic not in self.outgoing_maps.values()
+        if os.environ.get('OSAW_IDS_INLINE_TOPIC') == '1':
+            include_topic = True  # Experiment: never rely on the Watch's stream map for outgoing frames.
         wire = application(seq, stream, topic, identifier, payload, kind, flags, peer, response,
                            include_topic=include_topic, command=command, expiry=expiry)
         if len(wire) > 8000:
@@ -825,10 +842,16 @@ class IdsSession:
                     type=kind, sequence=seq, length=len(payload))
         return {'sequence': seq, 'id': identifier, 'topic': topic}
 
-    async def receive(self):
+    async def receive(self, timeout=None):
         if self.error:
             raise self.error
-        result = await asyncio.wait_for(self.incoming.get(), self.timeout)
+        wait = self.timeout if timeout is None else timeout
+        try:
+            result = await asyncio.wait_for(self.incoming.get(), wait)
+        except TimeoutError:
+            if timeout is not None:
+                return None
+            raise
         if self.error:
             raise self.error
         if isinstance(result, Exception):

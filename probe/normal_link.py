@@ -7,8 +7,8 @@ import asyncio
 import fcntl
 import ipaddress
 import os
+import socket
 import struct
-import subprocess
 import sys
 import time
 from nrlp import inet_checksum
@@ -27,8 +27,13 @@ def accept_prelude(packet, local):
     if len(packet) != 38 or packet[:9] != b'TERMINUS\x01' or packet[9] not in (13, 20) or packet[10:12] != b'\0\x18' or inet_checksum(packet[:-2]) != struct.unpack('>H', packet[-2:])[0]:
         raise ValueError('Invalid normal-link prelude')
     fields = tlvs(packet[12:-2])
-    if set(fields) != {4, 5} or len(fields[4]) != 16 or fields[5] not in (b'\0\0', b'\0\x01'):
-        raise ValueError('Unsupported normal-link UUID or TLS flags')
+    if set(fields) != {4, 5} or len(fields[4]) != 16 or len(fields[5]) != 2:
+        raise ValueError('Invalid normal-link UUID or flags')
+    flags = int.from_bytes(fields[5], 'big')
+    # watchOS 27 adds 0x0004 for MultiplexedASForNWSC, enabled only bilaterally.
+    # We advertise zero, so keep the existing path and verify the full prelude in AUTH.
+    if flags not in (0, 1, 5):
+        raise ValueError(f'Unsupported normal-link flags 0x{flags:04x}')
     # Both sides must agree: pairing states 13 and 20 cannot mix.
     if packet[9] != local[9]:
         raise ValueError(f'Incompatible normal-link pairing states {local[9]}/{packet[9]}')
@@ -103,6 +108,50 @@ def decode_lowpan(data, source_d, destination_d):
     return struct.pack('>IHBB', 0x60000000 | traffic << 20, len(body), nxt, hop) + src + dst + body
 
 
+def _nl_attr(kind, payload):
+    length = 4 + len(payload)
+    return struct.pack('=HH', length, kind) + payload + b'\0' * (-length % 4)
+
+
+def _nl_request(kind, flags, header, attrs):
+    """One acknowledged rtnetlink request; needs CAP_NET_ADMIN, not the ip tool.
+
+    iproute2 deliberately drops file capabilities, so a capability-limited `ip`
+    cannot configure the TUN. Only link up/MTU, a /128 address and a /128 route
+    are ever sent here.
+    """
+    body = header + b''.join(attrs)
+    message = struct.pack('=IHHII', 16 + len(body), kind, flags | 0x1 | 0x4, 1, 0) + body
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as nl:
+        nl.settimeout(5)
+        nl.send(message)
+        reply = nl.recv(4096)
+    _, reply_kind, _, _, _ = struct.unpack('=IHHII', reply[:16])
+    error = struct.unpack('=i', reply[16:20])[0] if reply_kind == 2 else -5
+    if error:
+        raise OSError(-error, os.strerror(-error))
+
+
+def configure_link(name, mtu):
+    index = socket.if_nametoindex(name)
+    _nl_request(16, 0, struct.pack('=BBHiII', 0, 0, 0, index, 1, 1), [_nl_attr(4, struct.pack('=I', mtu))])
+
+
+def add_host_address(name, address):
+    index = socket.if_nametoindex(name)
+    packed = ipaddress.IPv6Address(address).packed
+    # IFA_F_NODAD (0x02) in both the header byte and IFA_FLAGS, as `ip ... nodad`.
+    _nl_request(20, 0x400 | 0x200, struct.pack('=BBBBI', socket.AF_INET6, 128, 2, 0, index),
+                [_nl_attr(2, packed), _nl_attr(1, packed), _nl_attr(8, struct.pack('=I', 2))])
+
+
+def add_host_route(name, remote, source):
+    index = socket.if_nametoindex(name)
+    _nl_request(24, 0x400 | 0x200, struct.pack('=BBBBBBBBI', socket.AF_INET6, 128, 0, 0, 254, 3, 0, 1, 0),
+                [_nl_attr(1, ipaddress.IPv6Address(remote).packed), _nl_attr(4, struct.pack('=I', index)),
+                 _nl_attr(7, ipaddress.IPv6Address(source).packed)])
+
+
 class Tun:
     def __init__(self, local_d, remote_d, local_c, remote_c):
         if sys.platform != 'linux':
@@ -113,11 +162,11 @@ class Tun:
         try:
             configured = fcntl.ioctl(self.fd, 0x400454ca, struct.pack('16sH', b'watchpoc%d', 0x1001))
             self.name = configured[:16].split(b'\0')[0].decode('ascii')
-            subprocess.run(['ip', 'link', 'set', 'dev', self.name, 'mtu', '1280', 'up'], check=True, capture_output=True)
+            configure_link(self.name, 1280)
             for local, remote in ((local_d, remote_d), (local_c, remote_c)):
                 local, remote = str(ipaddress.IPv6Address(local)), str(ipaddress.IPv6Address(remote))
-                subprocess.run(['ip', '-6', 'addr', 'add', local + '/128', 'dev', self.name, 'nodad'], check=True, capture_output=True)
-                subprocess.run(['ip', '-6', 'route', 'add', remote + '/128', 'dev', self.name, 'src', local], check=True, capture_output=True)
+                add_host_address(self.name, local)
+                add_host_route(self.name, remote, local)
         except BaseException:
             os.close(self.fd)
             raise
@@ -365,7 +414,7 @@ class NormalLink:
                         and (multicast or (packet[8:24] == s.remote_address and packet[24:40] == s.local_address))), None)
         if session is None:
             # RFC 4303: ESP for an unknown SPI is discarded. The Watch can start ESP for a lane whose IKE_AUTH we have
-            # not completed yet; TCP retransmits the dropped packets.
+            # not completed yet (live 14:24: right after lane D authenticated); TCP above retransmits.
             self.unmatched_esp = getattr(self, 'unmatched_esp', 0) + 1
             if self.unmatched_esp <= 8:
                 self.record('normal_esp_unmatched_dropped', spi=packet[40:44].hex(), count=self.unmatched_esp)

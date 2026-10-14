@@ -17,7 +17,7 @@ TIMESYNC = 'com.apple.private.alloy.timesync'
 APPSYNC = 'com.apple.private.alloy.appsyncconduit.v2'
 # Topics the reference routes on the Class-D lane (IdsApplicationRoute.forTopic); everything else is Class-C.
 CLASS_D_TOPICS = (CREDS, NANO_D, PREFS, TIMESYNC, 'com.apple.private.alloy.timezonesync',
-                  'com.apple.private.alloy.clockface.sync', 'com.apple.private.alloy.bulletinboard.settings')
+                  'com.apple.private.alloy.clockface.sync', 'com.apple.private.alloy.bulletindistributor.settings')
 
 # kTMLSLink time-sync dictionaries as observed on the Class-D timesync topic.
 TM_MSG, TM_REQUEST_STATE, TM_ACK, TM_CONVERT = 'kTMLSLinkMsgKey', 6, 7, 8
@@ -330,9 +330,54 @@ def apple_time():
     return time.time() - 978307200
 
 
-def preferences(domain, values):
-    return (field(1, apple_time()) + field(2, domain)
-            + b''.join(field(3, field(1, name) + field(2, bplist(value))) for name, value in values.items()))
+def preferences(domain, values, *, two_way=False, timestamp=None):
+    """Native NPS user-defaults push; two-way writes include per-key timestamps."""
+    timestamp = apple_time() if timestamp is None else float(timestamp)
+    if type(two_way) is not bool:
+        raise ValueError('Invalid preferences two-way flag')
+    return (field(1, timestamp) + field(2, domain)
+            + b''.join(field(3, field(1, name) + field(2, bplist(value))
+                            + (field(3, True) + field(4, timestamp) if two_way else b''))
+                       for name, value in values.items()))
+
+
+def decode_preferences(payload):
+    """Decode type-0 NPS observations, retaining the original plist for storage."""
+    if len(payload) > 262144:
+        raise ValueError('Preferences observation exceeds size limit')
+    fields = protobuf(payload)
+    def text(value):
+        if not isinstance(value, bytes) or not 1 <= len(value) <= 1024:
+            raise ValueError('Invalid preferences domain or key')
+        decoded = value.decode('utf-8')
+        if '\0' in decoded:
+            raise ValueError('Invalid preferences domain or key')
+        return decoded
+    def changed(value):
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError('Invalid preferences timestamp')
+        return float(value)
+    domain = text(one(fields, 2))
+    timestamp = changed(one(fields, 1, 0.0))
+    keys = []
+    if len(fields.get(3, [])) > 512:
+        raise ValueError('Too many preferences keys')
+    for encoded in fields.get(3, []):
+        if not isinstance(encoded, bytes):
+            raise ValueError('Invalid preferences key message')
+        item = protobuf(encoded)
+        name = text(one(item, 1))
+        raw = one(item, 2)
+        if raw is not None and not isinstance(raw, bytes):
+            raise ValueError('Invalid preferences value')
+        two_way = one(item, 3, 0)
+        if type(two_way) is not int or two_way not in (0, 1):
+            raise ValueError('Invalid preferences two-way flag')
+        keys.append({'name': name, 'raw': raw,
+                     'value': plistlib.loads(raw) if raw is not None else None,
+                     'timestamp': changed(one(item, 4, timestamp)),
+                     'two_way': bool(two_way)})
+    return {'domain': domain, 'timestamp': timestamp, 'keys': keys}
 
 
 def sync_state(complete=False):

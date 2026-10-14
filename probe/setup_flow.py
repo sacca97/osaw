@@ -1,19 +1,49 @@
 """Initial NanoRegistry, activation and native PairedSync setup state machine."""
 import base64
 import hashlib
+import json
 from pathlib import Path
+import os
 import plistlib
 import re
+import sqlite3
 import time
 from pairing_store import user_owned
+from health_codec import HEALTH_TOPIC
+from health_inbox import receive_health
+from health_sync import advance_health, next_health_timeout, observe_health_message
+from health_receiver import receive_changes
+from software_update import SoftwareUpdate, TOPIC as OTA_TOPIC
 import uuid
 import yaml
 from Crypto.Util.asn1 import DerSequence, DerOctetString
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from apple_codec import (APPSYNC, CREDS, TIMESYNC, NANO_C, NANO_D, PBB, PREFS, PSY,
-    timesync_clock_replies, timesync_message_type, timesync_state_replies, apple_time,
-    archive, bplist, decode_nr_properties, field, nr_properties, one, preferences, protobuf, sync_state)
+from apple_codec import (APPSYNC, ARCHIVE_KEY, CREDS, TIMESYNC, timesync_clock_replies, timesync_message_type, timesync_state_replies, NANO_C, NANO_D, PBB, PREFS, PSY, apple_time,
+    archive, bplist, decode_nr_properties, decode_preferences, field, nr_properties, one, preferences, protobuf, sync_state)
+
+
+def diagnostic_properties(values):
+    """Only selected state fields; identifiers are fingerprints, never raw values."""
+    result = {}
+    for name in ('isSetup', 'isPaired', 'isActive', 'pairingID', 'bluetoothIdentifier',
+                 'minPairingCompatibilityVersion', 'maxPairingCompatibilityVersion',
+                 'pairingCompatibilityVersion', 'productType', 'modelNumber', 'chipID'):
+        item = {'present': name in values}
+        if name in values:
+            value = values[name]
+            if name in ('pairingID', 'bluetoothIdentifier') and value is not None:
+                encoded = value if isinstance(value, bytes) else str(value).lower().encode()
+                item['fingerprint'] = hashlib.sha256(encoded).hexdigest()[:16]
+                item['type'] = type(value).__name__
+            elif value is None or type(value) in (bool, int, float):
+                item['value'] = value
+            elif isinstance(value, str) and len(value) <= 80 and value.isprintable():
+                item['value'] = value
+            else:
+                item['type'] = type(value).__name__
+        result[name] = item
+    return result
 
 
 def service_diagnostics(payload, depth=0):
@@ -96,7 +126,6 @@ def service_diagnostics(payload, depth=0):
                 break
         summary['archived_errors'] = errors
     return summary
-
 
 
 def public_identity(signing, encryption):
@@ -193,6 +222,7 @@ class SetupFlow:
         self.local_info_ack = bool(store.data.get('ids_device_info_exchanged'))
         self.local_info_sequences = set()
         self.peer_info_requests = set()
+        self.mode_requests = {}
         self.watch = {}
         self.check = self.snapshot = self.property_request = self.normal = self.prepare = self.completion = None
         self.configured = self.activation = self.language_done = self.is_setup = self.sync_complete = False
@@ -200,13 +230,26 @@ class SetupFlow:
         self.normal_sent = self.completion_ack = False
         self.seen_messages = set()
         self.app_sync_sent = False
+        self.health_sequences = set()
+        self.health_blocked_reason = ''
         self.activation_cache = {}
         self.phone = phone_properties(store)
         self.reconnecting = store.data.get('setup_complete', False)
+        self.operational = None
+        self.software_update = SoftwareUpdate(self)
 
     def pairing_mode(self, state):
         version = self.ids.peer_hello['maximum'] or 26
-        return field(1, state) + field(2, 26) + field(3, version) + field(4, 25)
+        return field(1, state) + field(2, 27) + field(3, version) + field(4, 25)
+
+    async def send_pairing_mode(self, mode):
+        sent = await self.ids.send(NANO_D, 3, self.pairing_mode(mode))
+        label = {1: 'check', 3: 'configure', 4: 'normal'}[mode]
+        self.mode_requests[sent['id'].upper()] = (label, sent['sequence'])
+        self.record('nr_pairing_mode_sent', mode=label, sequence=sent['sequence'],
+                    phone_minimum=25, phone_maximum=27,
+                    watch_version=self.ids.peer_hello['maximum'] or 26)
+        return sent
 
     def diagnostic_status(self):
         values = {'watch_is_setup': self.is_setup, 'watch_setup_present': 'isSetup' in self.watch,
@@ -218,13 +261,75 @@ class SetupFlow:
         return {key: value if type(value) in (bool, int, float) else None
                 for key, value in values.items()}
 
+    def health_blocker(self):
+        setup_ready = self.is_setup and (
+            self.store.data.get('setup_complete') is True and self.reconnecting
+            or self.activation and self.sync_complete and self.completion_ack)
+        # isSetup is absent from some operational Watch property exports. An
+        # activation checkpoint permits negotiation, not Health acceptance.
+        activated = self.activation or (self.store.data.get('paired') is True
+                                       and self.store.data.get('activation_confirmed') is True)
+        if not (setup_ready or activated):
+            return 'waiting_for_activation'
+        if self.ids.phase != 'ready' or self.ids.peer_hello is None:
+            return 'waiting_for_ids_lanes'
+        if not self.peer_info or not self.local_info_ack:
+            return 'waiting_for_device_info_exchange'
+        if self.store.data.get('ids_peer_public', {}).get('A') is None:
+            return 'waiting_for_peer_health_identity'
+        return None
 
-    async def run(self):
+    def health_ready(self):
+        return self.health_blocker() is None
+
+    async def advance_health(self):
+        blocker = self.health_blocker()
+        if blocker != self.health_blocked_reason:
+            self.health_blocked_reason = blocker
+            self.record('health_sync_waiting' if blocker else 'health_bootstrap_ready',
+                        reason=blocker, health_accepted=False, data_applied=False)
+        if self.ids.peer_hello is None:
+            return
+        peer_id = self.ids.peer_hello['device']
+        try:
+            sent = await advance_health(self.ids, self.store, self.public['A'], peer_id,
+                                        self.health_ready(), self.record)
+            if sent:
+                self.health_sequences.add(sent['sequence'])
+        except (OSError, ValueError, TypeError, KeyError, TimeoutError, sqlite3.Error) as error:
+            self.record('health_sync_start_failed', error=type(error).__name__,
+                        data_applied=False, health_ack_sent=False)
+
+    def receive_timeout(self, maximum=None):
+        timeout = self.ids.timeout
+        if self.ids.peer_hello is not None:
+            try:
+                health_timeout = next_health_timeout(
+                    self.ids, self.store, self.public['A'], self.ids.peer_hello['device'], self.health_ready())
+                if health_timeout is not None:
+                    timeout = min(timeout, max(0.01, health_timeout))
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
+                self.record('health_sync_timer_unavailable', error=type(error).__name__)
+        return min(timeout, maximum) if maximum is not None else timeout
+
+    async def receive_or_advance(self, maximum=None):
+        message = await self.ids.receive(timeout=self.receive_timeout(maximum))
+        if message is None:
+            await self.advance()
+        return message
+
+    async def run(self, timeout=None):
+        deadline = time.monotonic() + timeout if timeout is not None else None
         await self.ids.wait_transport_quiet()
         await self.ids.send(CREDS, None, bplist({'command': 11, 'unique-id': self.request_id}))
         while True:
-            await self.accept(await self.ids.receive())
-            await self.advance()
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError('Watch setup timed out')
+            message = await self.receive_or_advance(remaining)
+            if message is not None:
+                await self.accept(message)
+                await self.advance()
             if self.reconnecting and self.peer_info and self.local_info_ack and self.is_setup:
                 self.record('reconnected_to_initialized_watch', is_setup=True)
                 return
@@ -235,8 +340,19 @@ class SetupFlow:
                 return
 
     async def accept(self, message):
+        if self.operational:
+            self.operational.accept(message)
         if message['event'] == 'ack':
             sequence = message['sequence']
+            if sequence in self.health_sequences and message['lane'] == 'c':
+                self.health_sequences.discard(sequence)
+                self.record('health_ids_transport_acknowledged', sequence=sequence,
+                            peer_delivery=False, data_applied=False, native_progress=False)
+            if message['lane'] == 'd':
+                for mode, pending_sequence in self.mode_requests.values():
+                    if sequence == pending_sequence:
+                        self.record('nr_pairing_mode_transport_ack', mode=mode, sequence=sequence,
+                                    application_acceptance=False)
             if sequence in self.local_info_sequences and message['lane'] == 'd':
                 self.local_info_sequences.discard(sequence)
                 self.local_info_ack = True
@@ -247,12 +363,36 @@ class SetupFlow:
                 self.property_request = await self.ids.send(NANO_C, 4, flags=1)
             return
         if message['event'] == 'app_ack':
+            if message['topic'] == HEALTH_TOPIC:
+                self.record('health_ids_application_receipt', peer_delivery=True,
+                            data_applied=False, native_progress=False)
             if self.completion and message['topic'] == self.completion['topic'] and message['peer'].upper() == self.completion['id']:
                 self.completion_ack = True
                 self.record('paired_sync_application_receipt')
             return
         topic, kind, payload = message['topic'], message['type'], message['payload']
         self.record('setup_message_received', topic=topic, type=kind, length=len(payload))
+        if topic == HEALTH_TOPIC:
+            result = receive_health(self.store, self.public['A'], message, self.record,
+                                    peer_id=self.ids.peer_hello['device'] if self.ids.peer_hello else None)
+            if result is not None and self.ids.peer_hello:
+                observe_health_message(self.store, self.public['A'], self.ids.peer_hello['device'],
+                                       result, self.record)
+                try:
+                    sent = await receive_changes(self.ids, self.store, self.public['A'], result, message, self.record)
+                    if sent:
+                        self.health_sequences.add(sent['sequence'])
+                except (OSError, ValueError, TypeError, KeyError, TimeoutError, sqlite3.Error) as error:
+                    self.record('health_incoming_failed', error=type(error).__name__,
+                                data_applied=False, health_ack_sent=False)
+                await self.advance_health()
+            return
+        request = self.mode_requests.get((message.get('peer') or '').upper())
+        if topic.startswith(NANO_D):
+            self.record('nr_message_received', topic=topic, type=kind, length=len(payload),
+                        response=bool(message.get('response')), correlated=request is not None,
+                        mode=request[0] if request else None,
+                        has_peer=bool(message.get('peer')))
         key = (topic, message['id'])
         # Resource chunks intentionally reuse one UUID and are stored separately by IDS.
         if key in self.seen_messages and topic not in (PBB, CREDS):
@@ -266,7 +406,11 @@ class SetupFlow:
             await self.timesync(message)
         elif topic == APPSYNC:
             await self.app_sync(message)
-        elif topic == 'com.apple.private.alloy.otaupdate':
+        elif topic == OTA_TOPIC:
+            try:
+                self.software_update.receive(message)
+            except (ValueError, TypeError, KeyError, OSError, plistlib.InvalidFileException) as error:
+                self.record('ota_observation_failed', error=type(error).__name__)
             self.record('ota_message_received', type=kind, length=len(payload),
                         response=bool(message.get('response')),
                         response_expected=bool(message['flags'] & 1),
@@ -274,24 +418,38 @@ class SetupFlow:
                         message_fingerprint=hashlib.sha256(message['id'].upper().encode()).hexdigest()[:16],
                         peer_fingerprint=hashlib.sha256(message['peer'].upper().encode()).hexdigest()[:16]
                                          if message.get('peer') else None,
-                        application_handler='not_implemented', **service_diagnostics(payload))
+                        application_handler='state_and_terms', **service_diagnostics(payload))
         elif topic in (NANO_C, NANO_D):
             if kind == 4 and not message['response']:
                 await self.ids.send(topic, 4, nr_properties(self.phone, response=True), peer=message['id'], response=True)
             elif kind == 2 or kind == 4 and message['response']:
                 received = decode_nr_properties(payload, response=kind == 4)
                 self.watch.update(received)
+                self.record('nr_watch_properties_received', type=kind,
+                            property_names=sorted(received),
+                            property_count=len(received),
+                            properties=diagnostic_properties(received),
+                            accumulated_properties=diagnostic_properties(self.watch),
+                            record_role='watch_reported_properties_companion_role_unverified')
                 self.is_setup = self.watch.get('isSetup') is True
                 if self.is_setup:
                     self.record('watch_is_setup_observed')
                 if 'productType' in self.watch and self.watch['productType'] != self.product:
                     raise ValueError('Watch NanoRegistry product differs from its setup advertisement')
             elif kind == 3 and message['response']:
-                if self.normal and message['peer'].upper() == self.normal['id'] and one(protobuf(payload), 1) != 1:
+                fields = protobuf(payload)
+                success = one(fields, 1)
+                self.record('nr_pairing_mode_response', mode=request[0] if request else None,
+                            correlated=request is not None, success_present=1 in fields,
+                            accepted=success == 1,
+                            success=success if type(success) in (bool, int) else None)
+                if self.normal and message['peer'].upper() == self.normal['id'] and success != 1:
                     raise ValueError('Watch rejected Normal pairing mode')
         elif topic == PBB:
             await self.pbbridge(message)
         elif topic in (PSY, PREFS) and kind in (0, 2):
+            if kind == 0:
+                self.observe_preferences(payload)
             fields = protobuf(payload)
             domain = one(fields, 2, b'').decode()
             if domain == 'com.apple.pairedsync':
@@ -309,8 +467,50 @@ class SetupFlow:
                         decoded = plistlib.loads(value)
                         if not isinstance(decoded, dict) or type(decoded.get('version')) is not int or decoded['version'] != 1:
                             raise ValueError('Invalid Watch PairedSync state')
+                        self.record('paired_sync_state_received', state_name=name, timestamp=changed,
+                                    applied=True,
+                                    state={key: {'present': key in decoded,
+                                                 'value': decoded.get(key) if type(decoded.get(key)) in (bool, int, float) else None}
+                                           for key in ('version', 'syncProgressState', 'globalProgress',
+                                                       'syncSessionType', 'migrationSync')})
                         self.sync_values[name], self.sync_timestamps[name] = decoded, changed
+                    else:
+                        self.record('paired_sync_state_ignored', state_name=name, timestamp=changed,
+                                    retained_timestamp=self.sync_timestamps[name], applied=False)
                 self.update_sync_complete()
+                self.record('setup_completion_status', **self.diagnostic_status())
+
+    def observe_preferences(self, payload):
+        """Persist Watch reports separately from outgoing requests and IDS ACKs."""
+        try:
+            observed = decode_preferences(payload)
+        except (ValueError, TypeError, OverflowError, plistlib.InvalidFileException) as error:
+            self.record('preferences_observation_failed', error=type(error).__name__)
+            return
+        domain = observed['domain']
+        saved = self.store.data.get('preferences_observed', {}).copy()
+        if domain not in saved and len(saved) >= 64:
+            self.record('preferences_observation_failed', reason='domain_limit')
+            return
+        retained = saved.get(domain, {}).copy()
+        changed = False
+        for item in observed['keys']:
+            previous = retained.get(item['name'])
+            applied = previous is None or item['timestamp'] >= previous['timestamp']
+            if previous is None and len(retained) >= 512:
+                applied = False
+            if applied:
+                retained[item['name']] = {'timestamp': item['timestamp'],
+                    'two_way': item['two_way'], 'value_present': item['raw'] is not None,
+                    'plist_base64': base64.b64encode(item['raw']).decode() if item['raw'] is not None else None}
+                changed = True
+            self.record('preferences_value_observed', domain=domain, key=item['name'],
+                        timestamp=item['timestamp'], two_way=item['two_way'], retained=applied,
+                        value_present=item['raw'] is not None,
+                        value_type=type(item['value']).__name__ if item['raw'] is not None else None)
+        if changed:
+            saved[domain] = retained
+            self.store.save(preferences_observed=saved)
 
     def update_sync_complete(self):
         watch = self.sync_values.get('PSYWatchSyncState', {})
@@ -426,7 +626,9 @@ class SetupFlow:
                      'encryption-key': self.public['D'], 'encryption-class-a-key': self.public['A'],
                      'encryption-class-c-key': self.public['C'], 'private-device-data': private,
                      'device-name': 'iPhone', 'hardware-version': 'iPhone18,1'}
-            sent = await self.ids.send(CREDS, None, bplist(reply))
+            # Experiment: OSAW_INFO_REPLY_PEER=1 correlates the reply to the request message UUID.
+            peer = message['id'] if os.environ.get('OSAW_INFO_REPLY_PEER') == '1' else ''
+            sent = await self.ids.send(CREDS, None, bplist(reply), peer=peer)
             self.local_info_sequences.add(sent['sequence'])
             self.record('ids_device_info_reply_sent', sequence=sent['sequence'])
         elif unique.upper() == self.request_id:
@@ -460,6 +662,8 @@ class SetupFlow:
                 if len(self.activation_cache) >= 8:
                     raise ValueError('Too many activation requests in one setup attempt')
                 response = await self.proxy.relay(encoded)
+                if response is None:
+                    return  # Activation Lock page withheld from the Watch (--activation-lock withhold); a retry asks Apple again
                 self.activation_cache[key] = encoded, response
             await self.ids.send(PBB, 2, response, peer=key)
         elif kind == 4:
@@ -500,21 +704,22 @@ class SetupFlow:
         if self.reconnecting:
             if self.peer_info and self.local_info_ack and self.property_request is None:
                 self.property_request = await self.ids.send(NANO_C, 4, flags=1)
+            await self.advance_health()
             return
         if self.peer_info and self.local_info_ack and self.check is None:
             await self.ids.wait_transport_quiet(minimum_wait=0.04)
-            self.check = await self.ids.send(NANO_D, 3, self.pairing_mode(1))
+            self.check = await self.send_pairing_mode(1)
         required = ('productType', 'modelNumber', 'chipID', 'capabilities')
         if self.property_request and not self.configured and all(self.watch.get(name) is not None for name in required):
             if not isinstance(self.watch['capabilities'], list) or not self.watch['capabilities']:
                 raise ValueError('Watch capability snapshot is invalid')
             self.configured = True
-            await self.ids.send(NANO_D, 3, self.pairing_mode(3))
+            await self.send_pairing_mode(3)
             # Authorized full-setup request includes committing the pairing.
             # A resumed setup re-sends the commit; never downgrade a Watch that already confirmed activation.
             self.store.save(paired=True, watch_product=self.product,
                             stage='activation_confirmed' if self.store.data.get('activation_confirmed') else 'pairing_committed')
-            self.normal = await self.ids.send(NANO_D, 3, self.pairing_mode(4))
+            self.normal = await self.send_pairing_mode(4)
             await self.ids.send(PBB, 111, field(1, self.timezone))
             # Retaining an already matching Watch locale avoids a setup relaunch.
             languages = self.watch.get('preferredLanguages') or [self.language]
@@ -529,3 +734,4 @@ class SetupFlow:
             await self.ids.send(PSY, 0, sync_state(False), flags=4)
             self.prepare = await self.ids.send(PBB, 21, flags=1)
             self.record('initial_sync_prepare_sent')
+        await self.advance_health()

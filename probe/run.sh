@@ -8,6 +8,7 @@ args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
   case "${args[i]}" in
     -h|--help) exec .venv/bin/python watch_poc.py --help ;;
+    --resume) ;;
     --transport)
       ((i+=1))
       transport="${args[i]:-}"
@@ -31,7 +32,8 @@ for ((i=0; i<${#args[@]}; i++)); do
 done
 
 sudo hciconfig "hci$controller" down || exit $?
-sudo --preserve-env=OSAW_VERBOSE .venv/bin/python watch_poc.py "$@"
+# watch_poc owns the interactive TUI; protocol/library logs remain in runs/.
+sudo --preserve-env=OSAW_VERBOSE,OSAW_IDS_INLINE_TOPIC,OSAW_INFO_REPLY_PEER,OSAW_IDS_SEQ_START,OSAW_IDS_SEND_PRIORITY .venv/bin/python watch_poc.py "$@"
 status=$?
 [ -d runs ] && sudo chown -R "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" runs
 exit "$status"

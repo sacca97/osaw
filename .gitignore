@@ -1,4 +1,7 @@
 .venv/
+# Local runtime links may point into the private archive.
+/probe/.venv
+/probe/runs
 .venv-probe/
 __pycache__/
 *.py[cod]
@@ -10,8 +13,17 @@ runs/
 pairing.json
 bond.json
 bond.json.tmp
+pairing.json.tmp
 .pairing-*
 events.jsonl
+control.sock
+# Health and other local databases, including SQLite sidecars.
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-*
+*.sqlite3-*
+*.db-*
 activation-response-*.bin
 activation-failure.bin
 resources/
@@ -25,6 +37,12 @@ resources/
 *.pcap.gz
 *.pcapng.gz
 *.pklg.gz
+*.cap.gz
+*.btsnoop.*
+*.snoop.*
+*.pcap.*
+*.pcapng.*
+*.pklg.*
 # Firmware and extracted binaries/caches are local analysis inputs.
 firmware/
 extracted/
@@ -33,12 +51,27 @@ libraries/
 *.ipsw
 *.dmg
 *.aea
-# Generated analysis includes device identifiers, keys and personal traffic.
-# Keep source, guides and public firmware-source metadata trackable.
-analysis/*
-!analysis/*.md
-!analysis/*.py
-!analysis/firmware-source.json
+*.img
+# Local Android repair inputs.
+/probe/redfin-repair-*/
+# Disassembler databases and analysis sidecars.
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.a2s
+# Local exploration and research are never part of companion releases.
+/analysis/
+/AGENTS.md
+/NEXT-STEPS.md
+/WORK.md
+/plan.md
+/idea.md
+/reverse-analysis.md
+/testing/
 # Local handoffs bundle private capture-derived information.
 HANDOFF.md
 mac-handoff.zip
@@ -51,8 +84,15 @@ mac-handoff.zip
 *.pem
 *.p12
 *.pfx
+*.p8
+*.keystore
+*.jks
 *.mobileprovision
 *.log
 
 # Local firmware archives.
 *.zip
+
+# Backups can contain private objects from earlier Git history.
+*.bundle
+/backups/

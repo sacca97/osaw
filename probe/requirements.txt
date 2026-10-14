@@ -1,7 +1,13 @@
-# Bluetooth host stack.
+# Portable environment; APIs also inspected in the available local Bumble checkout.
 bumble==0.0.235
 
-# X448, ML-KEM and AES-GCM. The OpenSSL backend needs version 48+ for ML-KEM.
+# For ike_sa_init.py (X448) and ike_keys.py/ike_intermediate.py (ML-KEM-1024,
+# AES-256-GCM). IMPORTANT: ML-KEM support was only added in cryptography
+# 47.0.0 (AWS-LC/BoringSSL backends), with OpenSSL backing (the relevant case
+# on a typical Linux install) only from 48.0.0 -- an earlier floor here would
+# install fine and then fail at runtime with an unrelated-looking
+# AttributeError on mlkem.MLKEM1024PrivateKey. Version installed and tested
+# during development of these modules: 50.0.2.
 cryptography>=48
 
 # Native P-256 point operations for Apple's SPAKE2+ profile.
@@ -10,5 +16,5 @@ pycryptodome>=3.24,<4
 # Reads the companion phone profile (phone_profile.yaml).
 PyYAML>=6,<7
 
-# Activation HTTPS client. The relay uses HTTP/1.1.
+# Reuse one verified-TLS HTTP/2 connection for both MobileActivation legs.
 httpx[http2]>=0.28,<1
